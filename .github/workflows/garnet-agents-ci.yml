@@ -1,20 +1,54 @@
 name: Garnet Agents Python CI
+
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/garnet-agents-ci.yml"
+      - ".github/scripts/garnet_mcp_smoke.py"
+      - "pyproject.toml"
+      - "uv.lock"
+
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-  dep-install:
-    name: Dependency Install (Garnet)
+  mcp-smoke:
+    name: MCP Tool Discovery (Garnet)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+
+      - name: Install dependencies
+        run: make sync
+
       - name: Garnet Runtime Visibility
         uses: garnet-org/action@v2
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
-      - name: Setup uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - name: Install dependencies
-        run: make sync
+          jibril_version: v2.14.0
+
+      - name: Discover git MCP tools
+        run: uv run python .github/scripts/garnet_mcp_smoke.py
+        env:
+          GARNET_MCP_COMMAND: uvx
+          GARNET_MCP_ARGS: >-
+            --from mcp-server-git==2026.6.16
+            mcp-server-git
+            --repository
+            .
