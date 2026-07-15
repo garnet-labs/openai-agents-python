@@ -46,7 +46,9 @@ jobs:
       - name: Discover git MCP tools
         run: uv run python .github/scripts/garnet_mcp_smoke.py
         env:
-          GARNET_MCP_COMMAND: .venv/bin/mcp-server-git
+          GARNET_MCP_COMMAND: uvx
           GARNET_MCP_ARGS: >-
+            --from mcp-server-git==2026.6.16
+            mcp-server-git
             --repository
             .
