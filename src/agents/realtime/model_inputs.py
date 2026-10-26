@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Union
+from typing import Any, Literal, TypeAlias
 
-from typing_extensions import NotRequired, TypeAlias, TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from .config import RealtimeSessionModelSettings
 from .model_events import RealtimeModelToolCallEvent
@@ -46,7 +46,7 @@ class RealtimeModelUserInputMessage(TypedDict):
     content: list[RealtimeModelInputTextContent | RealtimeModelInputImageContent]
 
 
-RealtimeModelUserInput: TypeAlias = Union[str, RealtimeModelUserInputMessage]
+RealtimeModelUserInput: TypeAlias = str | RealtimeModelUserInputMessage
 """A user input to be sent to the model."""
 
 
@@ -98,6 +98,20 @@ class RealtimeModelSendInterrupt:
     force_response_cancel: bool = False
     """Force sending a response.cancel event even if automatic cancellation is enabled."""
 
+    response_id: str | None = None
+    """Scope response cancellation and audio playback interruption to this response ID, when
+    supported by the model.
+
+    If the transport no longer has audio for this response, it must not interrupt unrelated current
+    playback. Audio playback is skipped when `cancel_response_only` is set.
+    """
+
+    cancel_response_only: bool = False
+    """Cancel only `response_id` without interrupting audio playback."""
+
+    playback_only: bool = False
+    """Interrupt playback for `response_id` without cancelling a response."""
+
 
 @dataclass
 class RealtimeModelSendSessionUpdate:
@@ -107,11 +121,11 @@ class RealtimeModelSendSessionUpdate:
     """The updated session settings to send."""
 
 
-RealtimeModelSendEvent: TypeAlias = Union[
-    RealtimeModelSendRawMessage,
-    RealtimeModelSendUserInput,
-    RealtimeModelSendAudio,
-    RealtimeModelSendToolOutput,
-    RealtimeModelSendInterrupt,
-    RealtimeModelSendSessionUpdate,
-]
+RealtimeModelSendEvent: TypeAlias = (
+    RealtimeModelSendRawMessage
+    | RealtimeModelSendUserInput
+    | RealtimeModelSendAudio
+    | RealtimeModelSendToolOutput
+    | RealtimeModelSendInterrupt
+    | RealtimeModelSendSessionUpdate
+)

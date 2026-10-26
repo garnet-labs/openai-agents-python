@@ -73,7 +73,7 @@ async def main() -> None:
                 name="codex_engineer",
                 sandbox_mode="read-only",
                 default_thread_options=ThreadOptions(
-                    model="gpt-5.4",
+                    model="gpt-5.5",
                     model_reasoning_effort="low",
                     network_access_enabled=True,
                     web_search_enabled=False,
@@ -98,7 +98,7 @@ async def main() -> None:
     # context: dict[str, str] = {}
 
     trace_id = gen_trace_id()
-    log(f"View trace: https://platform.openai.com/traces/trace?trace_id={trace_id}")
+    log(f"View trace: https://platform.openai.com/logs/trace?trace_id={trace_id}")
 
     with trace("Codex same thread example", trace_id=trace_id):
         log("Turn 1: inspect AGENTS.md with the Codex tool.")

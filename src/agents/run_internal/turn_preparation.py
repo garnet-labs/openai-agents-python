@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 from typing import Any
 
@@ -10,12 +9,15 @@ from ..exceptions import UserError
 from ..handoffs import Handoff, handoff
 from ..items import TResponseInputItem
 from ..lifecycle import AgentHooksBase, RunHooks, RunHooksBase
+from ..model_settings import ModelSettings
+from ..models.default_models import get_default_model_settings
 from ..models.interface import Model
 from ..run_config import CallModelData, ModelInputData, RunConfig
 from ..run_context import RunContextWrapper, TContext
 from ..tool import Tool
 from ..tracing import SpanError
 from ..util import _error_tracing
+from ..util._asyncio_tasks import gather_with_cancel
 
 __all__ = [
     "validate_run_hooks",
@@ -24,6 +26,7 @@ __all__ = [
     "get_handoffs",
     "get_all_tools",
     "get_model",
+    "get_model_settings",
 ]
 
 
@@ -77,7 +80,15 @@ async def maybe_filter_model_input(
         return updated
     except Exception as e:
         _error_tracing.attach_error_to_current_span(
-            SpanError(message="Error in call_model_input_filter", data={"error": str(e)})
+            SpanError(
+                message="Error in call_model_input_filter",
+                data={
+                    "error": _error_tracing.get_trace_error(
+                        trace_include_sensitive_data=run_config.trace_include_sensitive_data,
+                        error_message=str(e),
+                    )
+                },
+            )
         )
         raise
 
@@ -100,8 +111,8 @@ async def get_handoffs(agent: Agent[Any], context_wrapper: RunContextWrapper[Any
             return bool(await res)
         return bool(res)
 
-    results = await asyncio.gather(*(check_handoff_enabled(h) for h in handoffs))
-    enabled: list[Handoff] = [h for h, ok in zip(handoffs, results) if ok]
+    results = await gather_with_cancel(*(check_handoff_enabled(h) for h in handoffs))
+    enabled: list[Handoff] = [h for h, ok in zip(handoffs, results, strict=False) if ok]
     return enabled
 
 
@@ -130,3 +141,27 @@ def get_model(agent: Agent[Any], run_config: RunConfig) -> Model:
         return agent.model
 
     return run_config.model_provider.get_model(agent.model)
+
+
+def _implicit_model_settings_for_agent(agent: Agent[Any]) -> ModelSettings:
+    if agent.model is None:
+        return get_default_model_settings()
+    if isinstance(agent.model, str):
+        return get_default_model_settings(agent.model)
+    return ModelSettings()
+
+
+def _model_settings_for_resolved_name(agent: Agent[Any], run_config: RunConfig) -> ModelSettings:
+    if isinstance(run_config.model, str):
+        return get_default_model_settings(run_config.model)
+    if isinstance(run_config.model, Model):
+        return ModelSettings()
+    return _implicit_model_settings_for_agent(agent)
+
+
+def get_model_settings(agent: Agent[Any], run_config: RunConfig) -> ModelSettings:
+    """Resolve model settings, keeping implicit defaults aligned with the resolved model name."""
+    model_settings = agent.model_settings
+    if model_settings == _implicit_model_settings_for_agent(agent):
+        model_settings = _model_settings_for_resolved_name(agent, run_config)
+    return model_settings.resolve(run_config.model_settings)

@@ -5,9 +5,12 @@ that screenshots are taken and wrapped appropriately, and that the execute funct
 hooks and returns the expected ToolCallOutputItem."""
 
 import json
-from typing import Any, cast
+import logging
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
 
 import pytest
+from openai.types.responses import ResponseCompletedEvent
 from openai.types.responses.computer_action import (
     Click as BatchedClick,
     Screenshot as BatchedScreenshot,
@@ -38,17 +41,21 @@ from agents import (
     RunContextWrapper,
     RunHooks,
     Runner,
+    UserError,
     set_tracing_disabled,
     trace,
 )
 from agents.items import ToolCallOutputItem
 from agents.run_internal import run_loop
 from agents.run_internal.run_loop import ComputerAction, ToolRunComputerAction
+from agents.testing import ModelStep, ScriptedModel
 from agents.tool import ComputerToolSafetyCheckData
 
-from .fake_model import FakeModel
+from .model_test_helpers import get_response_obj
 from .test_responses import get_text_message
 from .testing_processor import SPAN_PROCESSOR_TESTING
+
+T = TypeVar("T")
 
 
 def _get_function_span(tool_name: str) -> dict[str, Any]:
@@ -77,6 +84,10 @@ def _get_agent_span(agent_name: str) -> dict[str, Any]:
     raise AssertionError(f"Agent span for '{agent_name}' not found")
 
 
+def _action_with_keys(factory: Callable[..., T], **kwargs: Any) -> T:
+    return cast(T, cast(Any, factory)(**kwargs))
+
+
 class LoggingComputer(Computer):
     """A `Computer` implementation that logs calls to its methods for verification in tests."""
 
@@ -96,14 +107,20 @@ class LoggingComputer(Computer):
         self.calls.append(("screenshot", ()))
         return self._screenshot_return
 
-    def click(self, x: int, y: int, button: str) -> None:
-        self.calls.append(("click", (x, y, button)))
+    def _log_mouse_action(self, name: str, *args: Any, keys: list[str] | None = None) -> None:
+        payload = args if keys is None else (*args, keys)
+        self.calls.append((name, payload))
 
-    def double_click(self, x: int, y: int) -> None:
-        self.calls.append(("double_click", (x, y)))
+    def click(self, x: int, y: int, button: str, *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("click", x, y, button, keys=keys)
 
-    def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
-        self.calls.append(("scroll", (x, y, scroll_x, scroll_y)))
+    def double_click(self, x: int, y: int, *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("double_click", x, y, keys=keys)
+
+    def scroll(
+        self, x: int, y: int, scroll_x: int, scroll_y: int, *, keys: list[str] | None = None
+    ) -> None:
+        self._log_mouse_action("scroll", x, y, scroll_x, scroll_y, keys=keys)
 
     def type(self, text: str) -> None:
         self.calls.append(("type", (text,)))
@@ -111,14 +128,14 @@ class LoggingComputer(Computer):
     def wait(self) -> None:
         self.calls.append(("wait", ()))
 
-    def move(self, x: int, y: int) -> None:
-        self.calls.append(("move", (x, y)))
+    def move(self, x: int, y: int, *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("move", x, y, keys=keys)
 
     def keypress(self, keys: list[str]) -> None:
         self.calls.append(("keypress", (keys,)))
 
-    def drag(self, path: list[tuple[int, int]]) -> None:
-        self.calls.append(("drag", (tuple(path),)))
+    def drag(self, path: list[tuple[int, int]], *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("drag", tuple(path), keys=keys)
 
 
 class LoggingAsyncComputer(AsyncComputer):
@@ -140,14 +157,20 @@ class LoggingAsyncComputer(AsyncComputer):
         self.calls.append(("screenshot", ()))
         return self._screenshot_return
 
-    async def click(self, x: int, y: int, button: str) -> None:
-        self.calls.append(("click", (x, y, button)))
+    def _log_mouse_action(self, name: str, *args: Any, keys: list[str] | None = None) -> None:
+        payload = args if keys is None else (*args, keys)
+        self.calls.append((name, payload))
 
-    async def double_click(self, x: int, y: int) -> None:
-        self.calls.append(("double_click", (x, y)))
+    async def click(self, x: int, y: int, button: str, *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("click", x, y, button, keys=keys)
 
-    async def scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
-        self.calls.append(("scroll", (x, y, scroll_x, scroll_y)))
+    async def double_click(self, x: int, y: int, *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("double_click", x, y, keys=keys)
+
+    async def scroll(
+        self, x: int, y: int, scroll_x: int, scroll_y: int, *, keys: list[str] | None = None
+    ) -> None:
+        self._log_mouse_action("scroll", x, y, scroll_x, scroll_y, keys=keys)
 
     async def type(self, text: str) -> None:
         self.calls.append(("type", (text,)))
@@ -155,14 +178,14 @@ class LoggingAsyncComputer(AsyncComputer):
     async def wait(self) -> None:
         self.calls.append(("wait", ()))
 
-    async def move(self, x: int, y: int) -> None:
-        self.calls.append(("move", (x, y)))
+    async def move(self, x: int, y: int, *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("move", x, y, keys=keys)
 
     async def keypress(self, keys: list[str]) -> None:
         self.calls.append(("keypress", (keys,)))
 
-    async def drag(self, path: list[tuple[int, int]]) -> None:
-        self.calls.append(("drag", (tuple(path),)))
+    async def drag(self, path: list[tuple[int, int]], *, keys: list[str] | None = None) -> None:
+        self._log_mouse_action("drag", tuple(path), keys=keys)
 
 
 @pytest.mark.asyncio
@@ -296,13 +319,193 @@ async def test_get_screenshot_reuses_terminal_batched_screenshot() -> None:
     assert screenshot_output == "captured"
 
 
+@pytest.mark.asyncio
+async def test_get_screenshot_preserves_modifier_keys_for_sync_driver() -> None:
+    computer = LoggingComputer(screenshot_return="with_keys")
+    tool_call = ResponseComputerToolCall(
+        id="c5",
+        type="computer_call",
+        action=_action_with_keys(
+            ActionClick, type="click", x=4, y=8, button="left", keys=["shift", "ctrl"]
+        ),
+        call_id="c5",
+        pending_safety_checks=[],
+        status="completed",
+    )
+
+    screenshot_output = await ComputerAction._execute_action_and_capture(computer, tool_call)
+
+    assert computer.calls == [
+        ("click", (4, 8, "left", ["shift", "ctrl"])),
+        ("screenshot", ()),
+    ]
+    assert screenshot_output == "with_keys"
+
+
+@pytest.mark.asyncio
+async def test_get_screenshot_preserves_modifier_keys_for_async_driver() -> None:
+    computer = LoggingAsyncComputer(screenshot_return="async_keys")
+    tool_call = ResponseComputerToolCall(
+        id="c6",
+        type="computer_call",
+        action=_action_with_keys(
+            ActionScroll, type="scroll", x=7, y=9, scroll_x=3, scroll_y=-2, keys=["alt"]
+        ),
+        call_id="c6",
+        pending_safety_checks=[],
+        status="completed",
+    )
+
+    screenshot_output = await ComputerAction._execute_action_and_capture(computer, tool_call)
+
+    assert computer.calls == [
+        ("scroll", (7, 9, 3, -2, ["alt"])),
+        ("screenshot", ()),
+    ]
+    assert screenshot_output == "async_keys"
+
+
+@pytest.mark.asyncio
+async def test_get_screenshot_drops_modifier_keys_for_legacy_driver_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class LegacyDriver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+        def screenshot(self) -> str:
+            self.calls.append(("screenshot", ()))
+            return "legacy"
+
+        def click(self, x: int, y: int, button: str) -> None:
+            self.calls.append(("click", (x, y, button)))
+
+    tool_call = ResponseComputerToolCall(
+        id="c7",
+        type="computer_call",
+        action=_action_with_keys(
+            ActionClick, type="click", x=1, y=1, button="left", keys=["shift"]
+        ),
+        call_id="c7",
+        pending_safety_checks=[],
+        status="completed",
+    )
+
+    driver = LegacyDriver()
+    with caplog.at_level(logging.WARNING, logger="openai.agents"):
+        screenshot_output = await ComputerAction._execute_action_and_capture(driver, tool_call)
+
+    assert driver.calls == [("click", (1, 1, "left")), ("screenshot", ())]
+    assert screenshot_output == "legacy"
+    assert "does not accept keyword argument(s) keys" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_screenshot_drops_modifier_keys_for_non_introspectable_driver_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class NonIntrospectableClick:
+        def __init__(self, calls: list[tuple[str, tuple[Any, ...]]]) -> None:
+            self._calls = calls
+
+        @property
+        def __signature__(self) -> Any:
+            raise ValueError("signature unavailable")
+
+        def __call__(self, x: int, y: int, button: str) -> None:
+            self._calls.append(("click", (x, y, button)))
+
+    class NonIntrospectableDriver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[Any, ...]]] = []
+            self.click = NonIntrospectableClick(self.calls)
+
+        def screenshot(self) -> str:
+            self.calls.append(("screenshot", ()))
+            return "non_introspectable"
+
+    tool_call = ResponseComputerToolCall(
+        id="c8",
+        type="computer_call",
+        action=_action_with_keys(
+            ActionClick, type="click", x=2, y=5, button="left", keys=["shift"]
+        ),
+        call_id="c8",
+        pending_safety_checks=[],
+        status="completed",
+    )
+
+    driver = NonIntrospectableDriver()
+    with caplog.at_level(logging.WARNING, logger="openai.agents"):
+        screenshot_output = await ComputerAction._execute_action_and_capture(driver, tool_call)
+
+    assert driver.calls == [("click", (2, 5, "left")), ("screenshot", ())]
+    assert screenshot_output == "non_introspectable"
+    assert "does not accept keyword argument(s) keys" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_get_screenshot_preserves_modifier_keys_for_kwargs_driver() -> None:
+    class KwargsDriver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+        def screenshot(self) -> str:
+            self.calls.append(("screenshot", (), {}))
+            return "kwargs"
+
+        def move(self, x: int, y: int, **kwargs: Any) -> None:
+            self.calls.append(("move", (x, y), kwargs))
+
+    tool_call = ResponseComputerToolCall(
+        id="c9",
+        type="computer_call",
+        action=_action_with_keys(ActionMove, type="move", x=10, y=12, keys=["meta"]),
+        call_id="c9",
+        pending_safety_checks=[],
+        status="completed",
+    )
+
+    driver = KwargsDriver()
+    screenshot_output = await ComputerAction._execute_action_and_capture(driver, tool_call)
+
+    assert driver.calls == [
+        ("move", (10, 12), {"keys": ["meta"]}),
+        ("screenshot", (), {}),
+    ]
+    assert screenshot_output == "kwargs"
+
+
+@pytest.mark.asyncio
+async def test_get_screenshot_preserves_modifier_keys_for_batched_actions() -> None:
+    computer = LoggingComputer(screenshot_return="batched_keys")
+    tool_call = ResponseComputerToolCall(
+        id="c10",
+        type="computer_call",
+        actions=[
+            _action_with_keys(BatchedClick, type="click", x=11, y=12, button="left", keys=["ctrl"])
+        ],
+        call_id="c10",
+        pending_safety_checks=[],
+        status="completed",
+    )
+
+    screenshot_output = await ComputerAction._execute_action_and_capture(computer, tool_call)
+
+    assert computer.calls == [
+        ("click", (11, 12, "left", ["ctrl"])),
+        ("screenshot", ()),
+    ]
+    assert screenshot_output == "batched_keys"
+
+
 class LoggingRunHooks(RunHooks[Any]):
     """Capture on_tool_start and on_tool_end invocations."""
 
     def __init__(self) -> None:
         super().__init__()
         self.started: list[tuple[Agent[Any], Any]] = []
-        self.ended: list[tuple[Agent[Any], Any, str]] = []
+        self.ended: list[tuple[Agent[Any], Any, object]] = []
 
     async def on_tool_start(
         self, context: RunContextWrapper[Any], agent: Agent[Any], tool: Any
@@ -310,7 +513,7 @@ class LoggingRunHooks(RunHooks[Any]):
         self.started.append((agent, tool))
 
     async def on_tool_end(
-        self, context: RunContextWrapper[Any], agent: Agent[Any], tool: Any, result: str
+        self, context: RunContextWrapper[Any], agent: Agent[Any], tool: Any, result: object
     ) -> None:
         self.ended.append((agent, tool, result))
 
@@ -321,7 +524,7 @@ class LoggingAgentHooks(AgentHooks[Any]):
     def __init__(self) -> None:
         super().__init__()
         self.started: list[tuple[Agent[Any], Any]] = []
-        self.ended: list[tuple[Agent[Any], Any, str]] = []
+        self.ended: list[tuple[Agent[Any], Any, object]] = []
 
     async def on_tool_start(
         self, context: RunContextWrapper[Any], agent: Agent[Any], tool: Any
@@ -329,7 +532,7 @@ class LoggingAgentHooks(AgentHooks[Any]):
         self.started.append((agent, tool))
 
     async def on_tool_end(
-        self, context: RunContextWrapper[Any], agent: Agent[Any], tool: Any, result: str
+        self, context: RunContextWrapper[Any], agent: Agent[Any], tool: Any, result: object
     ) -> None:
         self.ended.append((agent, tool, result))
 
@@ -439,8 +642,8 @@ async def test_runner_trace_lists_ga_computer_tool_name() -> None:
         pending_safety_checks=[],
         status="completed",
     )
-    model = FakeModel(tracing_enabled=True)
-    model.add_multiple_turn_outputs(
+    model = ScriptedModel(emit_traces=True)
+    model.extend(
         [
             [tool_call],
             [get_text_message("done")],
@@ -571,7 +774,7 @@ async def test_pending_safety_check_acknowledged() -> None:
     ctx = RunContextWrapper(context=None)
 
     results = await run_loop.execute_computer_actions(
-        agent=agent,
+        public_agent=agent,
         actions=[run_action],
         hooks=RunHooks[Any](),
         context_wrapper=ctx,
@@ -584,3 +787,94 @@ async def test_pending_safety_check_acknowledged() -> None:
     assert raw.get("acknowledged_safety_checks") == [{"id": "sc", "code": "c", "message": "m"}]
     assert len(called) == 1
     assert called[0].safety_check.id == "sc"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("handler", "has_checks"),
+    [("missing", True), ("missing", False), ("accept", True), ("reject", True)],
+)
+@pytest.mark.asyncio
+async def test_runner_warns_for_unhandled_computer_safety_checks(
+    caplog: pytest.LogCaptureFixture, stream: bool, handler: str, has_checks: bool
+) -> None:
+    should_warn = has_checks and handler == "missing"
+
+    def safety_warnings() -> list[logging.LogRecord]:
+        return [
+            record
+            for record in caplog.records
+            if record.name == "openai.agents" and "no on_safety_check" in record.getMessage()
+        ]
+
+    class WarningOrderComputer(LoggingComputer):
+        def click(self, x: int, y: int, button: str, *, keys: list[str] | None = None) -> None:
+            assert bool(safety_warnings()) is should_warn
+            super().click(x, y, button, keys=keys)
+
+    computer = WarningOrderComputer(screenshot_return="synthetic screenshot")
+    checks = [
+        PendingSafetyCheck(id=f"check-{index}", code=code, message="synthetic private message")
+        for index, code in enumerate(
+            ["malicious_instructions", "irrelevant_domain", "sensitive_domain", "future_check"]
+        )
+    ]
+    tool_call = ResponseComputerToolCall(
+        id="computer-call",
+        type="computer_call",
+        action=ActionClick(type="click", x=1, y=2, button="left"),
+        call_id="computer-call",
+        pending_safety_checks=checks if has_checks else [],
+        status="completed",
+    )
+    # Computer calls need explicit stream events in ScriptedModel.
+    step = ModelStep.stream(
+        [
+            ResponseCompletedEvent(
+                type="response.completed",
+                response=get_response_obj([tool_call]),
+                sequence_number=0,
+            )
+        ],
+        output=[tool_call],
+    )
+    model = ScriptedModel(steps=[step, [get_text_message("done")]])
+    tool = ComputerTool(
+        computer=computer,
+        on_safety_check=None if handler == "missing" else lambda _: handler == "accept",
+    )
+    agent = Agent(name="Computer safety checks", model=model, tools=[tool])
+
+    async def run_agent():
+        config = RunConfig(tracing_disabled=True)
+        if stream:
+            result = Runner.run_streamed(agent, "start", run_config=config)
+            async for _ in result.stream_events():
+                pass
+            return result
+        return await Runner.run(agent, "start", run_config=config)
+
+    with caplog.at_level(logging.WARNING, logger="openai.agents"):
+        if handler == "reject":
+            with pytest.raises(UserError, match="safety check was not acknowledged"):
+                await run_agent()
+            assert computer.calls == []
+        else:
+            result = await run_agent()
+            assert result.final_output == "done"
+            assert computer.calls == [("click", (1, 2, "left")), ("screenshot", ())]
+            output = next(item for item in result.new_items if isinstance(item, ToolCallOutputItem))
+            raw = cast(dict[str, Any], output.raw_item)
+            if handler == "accept":
+                assert raw["acknowledged_safety_checks"] == [check.model_dump() for check in checks]
+            else:
+                assert raw.get("acknowledged_safety_checks") is None
+
+    warnings = safety_warnings()
+    assert len(warnings) == int(should_warn)
+    if warnings:
+        assert warnings[0].levelno == logging.WARNING
+        assert "proceed without acknowledging" in warnings[0].getMessage()
+        assert "Configure ComputerTool.on_safety_check" in warnings[0].getMessage()
+        assert warnings[0].args == ()
+        assert "synthetic private message" not in warnings[0].getMessage()

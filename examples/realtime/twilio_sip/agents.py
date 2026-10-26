@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from agents import function_tool
+from agents.decorators import tool
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from agents.realtime import RealtimeAgent, realtime_handoff
 
@@ -14,9 +14,7 @@ from agents.realtime import RealtimeAgent, realtime_handoff
 WELCOME_MESSAGE = "Hello, this is ABC customer service. How can I help you today?"
 
 
-@function_tool(
-    name_override="faq_lookup_tool", description_override="Lookup frequently asked questions."
-)
+@tool(name_override="faq_lookup_tool", description_override="Lookup frequently asked questions.")
 async def faq_lookup_tool(question: str) -> str:
     """Fetch FAQ answers for the caller."""
 
@@ -32,7 +30,7 @@ async def faq_lookup_tool(question: str) -> str:
     return "I'm not sure about that. Let me transfer you back to the triage agent."
 
 
-@function_tool
+@tool
 async def update_customer_record(customer_id: str, note: str) -> str:
     """Record a short note about the caller."""
 
@@ -74,11 +72,18 @@ triage_agent = RealtimeAgent(
         "before collecting details. Once the greeting is complete, gather context and hand off to "
         "the FAQ or Records agents when appropriate."
     ),
-    handoffs=[faq_agent, realtime_handoff(records_agent)],
+    handoffs=[
+        realtime_handoff(faq_agent, tool_name_override="transfer_to_faq_agent"),
+        realtime_handoff(records_agent, tool_name_override="transfer_to_records_agent"),
+    ],
 )
 
-faq_agent.handoffs.append(triage_agent)
-records_agent.handoffs.append(triage_agent)
+faq_agent.handoffs.append(
+    realtime_handoff(triage_agent, tool_name_override="transfer_to_triage_agent")
+)
+records_agent.handoffs.append(
+    realtime_handoff(triage_agent, tool_name_override="transfer_to_triage_agent")
+)
 
 
 def get_starting_agent() -> RealtimeAgent:

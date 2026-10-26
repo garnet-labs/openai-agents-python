@@ -6,10 +6,12 @@ approval plumbing, and payload coercion. Action classes live in tool_actions.py.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import functools
 import inspect
 import json
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
@@ -18,15 +20,20 @@ from openai.types.responses.response_input_item_param import (
     ComputerCallOutputAcknowledgedSafetyCheck,
 )
 from openai.types.responses.response_input_param import McpApprovalResponse
-from openai.types.responses.response_output_item import McpApprovalRequest
 
+from .. import _debug
+from .._function_tool_arguments import FunctionToolApproval
+from .._public_agent import get_public_agent
 from .._tool_identity import (
     FunctionToolLookupKey,
     NamedToolLookupKey,
     build_function_tool_lookup_map,
     get_function_tool_lookup_key,
     get_function_tool_lookup_key_for_call,
+    get_function_tool_lookup_key_for_tool,
     get_function_tool_trace_name,
+    get_hosted_mcp_approval_request_identity,
+    get_tool_approval_item_call_id,
     get_tool_call_namespace,
     get_tool_call_trace_name,
     is_deferred_top_level_function_tool,
@@ -47,6 +54,7 @@ from ..exceptions import (
     ToolInputGuardrailTripwireTriggered,
     ToolOutputGuardrailTripwireTriggered,
     UserError,
+    _mark_tool_local_cancellation,
 )
 from ..items import (
     ItemHelpers,
@@ -56,7 +64,7 @@ from ..items import (
     ToolApprovalItem,
     ToolCallOutputItem,
 )
-from ..logger import logger
+from ..logger import log_tool_action_error as _log_tool_action_error, logger
 from ..model_settings import ModelSettings
 from ..run_config import RunConfig, ToolErrorFormatterArgs
 from ..run_context import RunContextWrapper
@@ -65,15 +73,23 @@ from ..tool import (
     ComputerTool,
     ComputerToolSafetyCheckData,
     FunctionTool,
+    FunctionToolCustomDataContext,
     FunctionToolResult,
     ShellActionRequest,
     ShellCallData,
     ShellCallOutcome,
     ShellCommandOutput,
     Tool,
-    invoke_function_tool,
+    ToolOrigin,
+    _computer_tool_uses_run_scoped_initializer,
+    _consume_function_tool_default_failure,
+    _invoke_function_tool_with_metadata,
+    _is_programmatic_tool_call,
+    default_tool_error_function,
+    get_function_tool_origin,
     maybe_invoke_function_tool_failure_error_function,
     resolve_computer,
+    resolve_function_tool_failure_error_function,
 )
 from ..tool_context import ToolContext
 from ..tool_guardrails import (
@@ -84,15 +100,20 @@ from ..tool_guardrails import (
 )
 from ..tracing import Span, SpanError, function_span, get_current_trace
 from ..util import _coro, _error_tracing
-from ..util._approvals import evaluate_needs_approval_setting
+from ..util._approvals import evaluate_function_tool_approval
+from ..util._asyncio_tasks import _consume_future_exception, gather_with_cancel
+from ..util._custom_data import maybe_extract_custom_data, merge_custom_data
+from ..util._tool_errors import get_trace_tool_error
 from ..util._types import MaybeAwaitable
 from ._asyncio_progress import get_function_tool_task_progress_deadline
+from .agent_bindings import AgentBindings, bind_public_agent
 from .approvals import append_approval_error_output
 from .items import (
     REJECTION_MESSAGE,
     extract_mcp_request_id,
     extract_mcp_request_id_from_run,
     function_rejection_item,
+    function_tool_error_output,
 )
 from .run_steps import ToolRunFunction
 from .tool_use_tracker import AgentToolUseTracker
@@ -102,6 +123,7 @@ if TYPE_CHECKING:
     from .run_steps import (
         ToolRunApplyPatchCall,
         ToolRunComputerAction,
+        ToolRunCustom,
         ToolRunFunction,
         ToolRunLocalShellCall,
         ToolRunShellCall,
@@ -114,8 +136,10 @@ __all__ = [
     "coerce_shell_call",
     "parse_apply_patch_custom_input",
     "parse_apply_patch_function_args",
+    "normalize_apply_patch_fallback_call",
     "extract_apply_patch_call_id",
     "coerce_apply_patch_operation",
+    "coerce_apply_patch_operations",
     "normalize_apply_patch_result",
     "is_apply_patch_name",
     "normalize_shell_output",
@@ -129,16 +153,15 @@ __all__ = [
     "get_trace_tool_error",
     "with_tool_function_span",
     "build_litellm_json_tool_call",
-    "process_hosted_mcp_approvals",
     "collect_manual_mcp_approvals",
     "index_approval_items_by_call_id",
-    "should_keep_hosted_mcp_item",
     "resolve_approval_status",
     "resolve_approval_interruption",
     "resolve_approval_rejection_message",
     "function_needs_approval",
     "resolve_enabled_function_tools",
     "execute_function_tool_calls",
+    "execute_custom_tool_calls",
     "execute_local_shell_calls",
     "execute_shell_calls",
     "execute_apply_patch_calls",
@@ -146,9 +169,9 @@ __all__ = [
     "execute_approved_tools",
 ]
 
-REDACTED_TOOL_ERROR_MESSAGE = "Tool execution failed. Error details are redacted."
 TToolSpanResult = TypeVar("TToolSpanResult")
-_FUNCTION_TOOL_CANCELLED_DRAIN_SECONDS = 0.1
+_FUNCTION_TOOL_CANCELLED_DRAIN_SECONDS = 0.25
+_FUNCTION_TOOL_CANCELLED_IMMEDIATE_STEP_LIMIT = 64
 _FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS = 0.1
 
 
@@ -167,6 +190,14 @@ class _FunctionToolFailure:
     error: BaseException
     order: int
     source: _FunctionToolFailureSource = "direct"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ToolOutputGuardrailExecutionResult:
+    """A tool output plus whether it was synthesized by a rejecting guardrail."""
+
+    output: Any
+    is_rejection: bool = False
 
 
 @dataclasses.dataclass
@@ -360,7 +391,7 @@ async def _wait_for_cancelled_function_tool_task_progress(
     remaining_time: float,
     *,
     task_states: Mapping[asyncio.Task[Any], _FunctionToolTaskState],
-) -> bool:
+) -> tuple[bool, bool]:
     """Wait until a cancelled sibling can make another self-driven step."""
     task_to_invoke_task = {
         tracked_task: task_state.invoke_task
@@ -379,7 +410,7 @@ async def _wait_for_cancelled_function_tool_task_progress(
         task: deadline for task, deadline in progress_deadlines.items() if deadline is not None
     }
     if not self_progressing_tasks:
-        return False
+        return False, False
 
     now = loop.time()
     next_deadline = min(self_progressing_tasks.values())
@@ -390,9 +421,10 @@ async def _wait_for_cancelled_function_tool_task_progress(
             timeout=min(delay, remaining_time),
             return_when=asyncio.FIRST_COMPLETED,
         )
-    else:
-        await asyncio.sleep(0)
-    return True
+        return True, False
+
+    await asyncio.sleep(0)
+    return True, True
 
 
 async def _wait_for_function_tool_task_completion(
@@ -468,19 +500,36 @@ async def _drain_cancelled_function_tool_tasks(
     ignore_cancelled_tasks: set[asyncio.Task[Any]] | None = None,
 ) -> tuple[_FunctionToolFailure | None, set[asyncio.Task[Any]]]:
     """Drain cancelled siblings while they can continue making self-driven progress."""
+    remaining_immediate_steps = _FUNCTION_TOOL_CANCELLED_IMMEDIATE_STEP_LIMIT
+
+    async def _wait_for_progress(
+        remaining: set[asyncio.Task[Any]],
+        loop: asyncio.AbstractEventLoop,
+        remaining_time: float,
+    ) -> bool:
+        nonlocal remaining_immediate_steps
+        if remaining_immediate_steps <= 0:
+            return False
+
+        (
+            should_continue,
+            consumed_immediate_step,
+        ) = await _wait_for_cancelled_function_tool_task_progress(
+            remaining,
+            loop,
+            remaining_time,
+            task_states=task_states,
+        )
+        if consumed_immediate_step:
+            remaining_immediate_steps -= 1
+        return should_continue
+
     return await _settle_pending_function_tool_tasks(
         pending_tasks=pending_tasks,
         task_states=task_states,
         results_by_tool_run=results_by_tool_run,
         timeout_seconds=_FUNCTION_TOOL_CANCELLED_DRAIN_SECONDS,
-        wait_for_pending_tasks=lambda remaining, loop, remaining_time: (
-            _wait_for_cancelled_function_tool_task_progress(
-                remaining,
-                loop,
-                remaining_time,
-                task_states=task_states,
-            )
-        ),
+        wait_for_pending_tasks=_wait_for_progress,
         failure_sources_by_task=failure_sources_by_task,
         ignore_cancelled_tasks=ignore_cancelled_tasks,
     )
@@ -531,7 +580,7 @@ async def resolve_enabled_function_tools(
         attr = tool.is_enabled
         if isinstance(attr, bool):
             return attr
-        result = attr(context_wrapper, agent)
+        result = attr(context_wrapper, get_public_agent(agent))
         if inspect.isawaitable(result):
             return bool(await result)
         return bool(result)
@@ -540,23 +589,37 @@ async def resolve_enabled_function_tools(
     if not function_tools:
         return []
 
-    enabled_results = await asyncio.gather(*(_check_tool_enabled(tool) for tool in function_tools))
-    return [tool for tool, enabled in zip(function_tools, enabled_results) if enabled]
+    enabled_results = await gather_with_cancel(
+        *(_check_tool_enabled(tool) for tool in function_tools)
+    )
+    return [tool for tool, enabled in zip(function_tools, enabled_results, strict=False) if enabled]
 
 
 async def initialize_computer_tools(
     *,
     tools: list[Tool],
     context_wrapper: RunContextWrapper[Any],
-) -> None:
-    """Resolve computer tools ahead of model invocation so each run gets its own instance."""
+) -> list[Tool]:
+    """Resolve computer tools and return run-local copies for model invocation."""
     computer_tools = [tool for tool in tools if isinstance(tool, ComputerTool)]
     if not computer_tools:
-        return
+        return tools
 
-    await asyncio.gather(
+    run_scoped_tools = {
+        tool for tool in computer_tools if _computer_tool_uses_run_scoped_initializer(tool)
+    }
+
+    resolved_computers = await gather_with_cancel(
         *(resolve_computer(tool=tool, run_context=context_wrapper) for tool in computer_tools)
     )
+    resolved_by_tool = dict(zip(computer_tools, resolved_computers, strict=True))
+
+    return [
+        dataclasses.replace(tool, computer=resolved_by_tool[tool])
+        if isinstance(tool, ComputerTool) and tool in run_scoped_tools
+        else tool
+        for tool in tools
+    ]
 
 
 def get_mapping_or_attr(target: Any, key: str) -> Any:
@@ -580,7 +643,7 @@ def extract_tool_call_id(raw: Any) -> str | None:
 
 def extract_shell_call_id(tool_call: Any) -> str:
     """Ensure shell calls include a call_id before executing them."""
-    value = extract_tool_call_id(tool_call)
+    value = get_mapping_or_attr(tool_call, "call_id")
     if not value:
         raise ModelBehaviorError("Shell call is missing call_id.")
     return str(value)
@@ -594,8 +657,12 @@ def coerce_shell_call(tool_call: Any) -> ShellCallData:
         raise ModelBehaviorError("Shell call is missing an action payload.")
 
     commands_value = get_mapping_or_attr(action_payload, "commands")
-    if not isinstance(commands_value, Sequence):
-        raise ModelBehaviorError("Shell call action is missing commands.")
+    if isinstance(commands_value, str | bytes | bytearray) or not isinstance(
+        commands_value, Sequence
+    ):
+        raise ModelBehaviorError(
+            "Shell call action commands must be a sequence of command strings."
+        )
     commands: list[str] = []
     for entry in commands_value:
         if entry is None:
@@ -604,19 +671,36 @@ def coerce_shell_call(tool_call: Any) -> ShellCallData:
     if not commands:
         raise ModelBehaviorError("Shell call action must include at least one command.")
 
-    timeout_value = (
-        get_mapping_or_attr(action_payload, "timeout_ms")
-        or get_mapping_or_attr(action_payload, "timeoutMs")
-        or get_mapping_or_attr(action_payload, "timeout")
-    )
-    timeout_ms = int(timeout_value) if isinstance(timeout_value, (int, float)) else None
+    # Zero intentionally follows the same alias fallback as None because it has no portable
+    # meaning across application-provided shell executors.
+    timeout_value = None
+    for candidate in (
+        get_mapping_or_attr(action_payload, "timeout_ms"),
+        get_mapping_or_attr(action_payload, "timeoutMs"),
+        get_mapping_or_attr(action_payload, "timeout"),
+    ):
+        if candidate is None or (
+            isinstance(candidate, int | float)
+            and not isinstance(candidate, bool)
+            and candidate == 0
+        ):
+            continue
+        timeout_value = candidate
+        break
+
+    if timeout_value is None:
+        timeout_ms = None
+    elif isinstance(timeout_value, bool) or not isinstance(timeout_value, int) or timeout_value < 0:
+        raise ModelBehaviorError(
+            "Shell call action timeout must be a positive integer in milliseconds, zero, or None."
+        )
+    else:
+        timeout_ms = timeout_value
 
     max_length_value = get_mapping_or_attr(action_payload, "max_output_length")
     if max_length_value is None:
         max_length_value = get_mapping_or_attr(action_payload, "maxOutputLength")
-    max_output_length = (
-        int(max_length_value) if isinstance(max_length_value, (int, float)) else None
-    )
+    max_output_length = int(max_length_value) if isinstance(max_length_value, int | float) else None
 
     action = ShellActionRequest(
         commands=commands,
@@ -646,8 +730,11 @@ def _parse_apply_patch_json(payload: str, *, label: str) -> dict[str, Any]:
 
 
 def parse_apply_patch_custom_input(input_json: str) -> dict[str, Any]:
-    """Parse custom apply_patch tool input used when a tool passes raw JSON strings."""
-    return _parse_apply_patch_json(input_json, label="input")
+    """Parse custom apply_patch tool input used by legacy hosted-tool rollouts."""
+    parsed = _parse_apply_patch_json(input_json, label="input")
+    if "operation" in parsed or "operations" in parsed:
+        return parsed
+    return {"operation": parsed}
 
 
 def parse_apply_patch_function_args(arguments: str) -> dict[str, Any]:
@@ -655,9 +742,37 @@ def parse_apply_patch_function_args(arguments: str) -> dict[str, Any]:
     return _parse_apply_patch_json(arguments, label="arguments")
 
 
+def normalize_apply_patch_fallback_call(tool_call: Any) -> dict[str, Any] | None:
+    """Normalize supported custom/function apply_patch fallbacks into one pseudo-call."""
+    call_type = get_mapping_or_attr(tool_call, "type")
+    call_id = get_mapping_or_attr(tool_call, "call_id")
+    if call_type == "custom_tool_call":
+        parsed_operation = parse_apply_patch_custom_input(
+            str(get_mapping_or_attr(tool_call, "input") or "")
+        )
+        pseudo_call = {
+            "type": "apply_patch_call",
+            "call_id": call_id,
+            **parsed_operation,
+        }
+    elif call_type == "function_call":
+        parsed_operation = parse_apply_patch_function_args(
+            str(get_mapping_or_attr(tool_call, "arguments") or "")
+        )
+        pseudo_call = {
+            "type": "apply_patch_call",
+            "call_id": call_id,
+            "operation": parsed_operation,
+        }
+    else:
+        return None
+    ItemHelpers.copy_tool_call_caller(tool_call, pseudo_call)
+    return pseudo_call
+
+
 def extract_apply_patch_call_id(tool_call: Any) -> str:
     """Ensure apply_patch calls include a call_id for approvals and tracing."""
-    value = extract_tool_call_id(tool_call)
+    value = get_mapping_or_attr(tool_call, "call_id")
     if not value:
         raise ModelBehaviorError("Apply patch call is missing call_id.")
     return str(value)
@@ -666,8 +781,44 @@ def extract_apply_patch_call_id(tool_call: Any) -> str:
 def coerce_apply_patch_operation(
     tool_call: Any, *, context_wrapper: RunContextWrapper[Any]
 ) -> ApplyPatchOperation:
-    """Normalize the tool payload into an ApplyPatchOperation the editor can consume."""
+    """Normalize a single-operation tool payload for legacy callers."""
+    operations = coerce_apply_patch_operations(tool_call, context_wrapper=context_wrapper)
+    if len(operations) != 1:
+        raise ModelBehaviorError(
+            f"Apply patch call includes {len(operations)} operations; expected exactly one."
+        )
+    return operations[0]
+
+
+def coerce_apply_patch_operations(
+    tool_call: Any | None = None,
+    *,
+    context_wrapper: RunContextWrapper[Any],
+) -> list[ApplyPatchOperation]:
+    """Normalize apply_patch payloads into one or more editor operations."""
+    raw_operations = get_mapping_or_attr(tool_call, "operations")
+    if isinstance(raw_operations, list):
+        operations = [
+            _coerce_apply_patch_operation_payload(operation, context_wrapper=context_wrapper)
+            for operation in raw_operations
+        ]
+        if not operations:
+            raise ModelBehaviorError("Apply patch call includes no operations.")
+        return operations
+
     raw_operation = get_mapping_or_attr(tool_call, "operation")
+    if raw_operation is not None:
+        return [
+            _coerce_apply_patch_operation_payload(raw_operation, context_wrapper=context_wrapper)
+        ]
+
+    raise ModelBehaviorError("Apply patch call is missing an operation payload.")
+
+
+def _coerce_apply_patch_operation_payload(
+    raw_operation: Any, *, context_wrapper: RunContextWrapper[Any]
+) -> ApplyPatchOperation:
+    """Normalize the tool payload into an ApplyPatchOperation the editor can consume."""
     if raw_operation is None:
         raise ModelBehaviorError("Apply patch call is missing an operation payload.")
 
@@ -695,7 +846,17 @@ def coerce_apply_patch_operation(
         path=str(path),
         diff=diff,
         ctx_wrapper=context_wrapper,
+        move_to=_coerce_apply_patch_move_to(raw_operation),
     )
+
+
+def _coerce_apply_patch_move_to(raw_operation: Any) -> str | None:
+    move_to = get_mapping_or_attr(raw_operation, "move_to")
+    if move_to is None:
+        return None
+    if not isinstance(move_to, str) or not move_to:
+        raise ModelBehaviorError("Apply patch operation move_to must be a non-empty path.")
+    return move_to
 
 
 def normalize_apply_patch_result(
@@ -724,7 +885,7 @@ def is_apply_patch_name(name: str | None, tool: ApplyPatchTool | None) -> bool:
     candidate = name.strip().lower()
     if candidate.startswith("apply_patch"):
         return True
-    if tool and candidate == tool.name.strip().lower():
+    if tool is not None and candidate == tool.name.strip().lower():
         return True
     return False
 
@@ -937,9 +1098,29 @@ def format_shell_error(error: Exception | BaseException | Any) -> str:
         return repr(error)
 
 
-def get_trace_tool_error(*, trace_include_sensitive_data: bool, error_message: str) -> str:
-    """Return a trace-safe tool error string based on the sensitive-data setting."""
-    return error_message if trace_include_sensitive_data else REDACTED_TOOL_ERROR_MESSAGE
+def _tool_name_diagnostic_extra(tool_name: str) -> dict[str, object]:
+    return {"tool_name": tool_name}
+
+
+def log_tool_action_error(
+    message: str,
+    exc: Exception | BaseException,
+    *,
+    diagnostic_extra: Callable[[], Mapping[str, object]] | None = None,
+) -> None:
+    """Log a tool-action failure without leaking tool data.
+
+    Tool exceptions can embed tool call arguments or output, so the exception is
+    redacted by default (matching ``_debug.DONT_LOG_TOOL_DATA``). The full exception
+    and traceback are logged only when tool-data logging is explicitly enabled.
+    """
+    _log_tool_action_error(
+        logger,
+        message,
+        exc,
+        stacklevel=4,
+        diagnostic_extra=diagnostic_extra,
+    )
 
 
 async def with_tool_function_span(
@@ -980,6 +1161,7 @@ def build_litellm_json_tool_call(output: ResponseFunctionToolCall) -> FunctionTo
         on_invoke_tool=on_invoke_tool,
         strict_json_schema=True,
         is_enabled=True,
+        _emit_tool_origin=False,
     )
 
 
@@ -992,6 +1174,7 @@ async def resolve_approval_status(
     context_wrapper: RunContextWrapper[Any],
     tool_namespace: str | None = None,
     tool_lookup_key: FunctionToolLookupKey | None = None,
+    tool_origin: ToolOrigin | None = None,
     on_approval: Callable[[RunContextWrapper[Any], ToolApprovalItem], Any] | None = None,
 ) -> tuple[bool | None, ToolApprovalItem]:
     """Build approval item, run on_approval hook if needed, and return latest approval status."""
@@ -1000,6 +1183,7 @@ async def resolve_approval_status(
         raw_item=raw_item,
         tool_name=tool_name,
         tool_namespace=tool_namespace,
+        tool_origin=tool_origin,
         tool_lookup_key=tool_lookup_key,
     )
     approval_status = context_wrapper.get_approval_status(
@@ -1008,8 +1192,9 @@ async def resolve_approval_status(
         tool_namespace=tool_namespace,
         existing_pending=approval_item,
         tool_lookup_key=tool_lookup_key,
+        current_invocation=approval_item,
     )
-    if approval_status is None and on_approval:
+    if approval_status is None and on_approval is not None:
         decision_result = on_approval(context_wrapper, approval_item)
         if inspect.isawaitable(decision_result):
             decision_result = await decision_result
@@ -1017,13 +1202,19 @@ async def resolve_approval_status(
             if decision_result.get("approve") is True:
                 context_wrapper.approve_tool(approval_item)
             elif decision_result.get("approve") is False:
-                context_wrapper.reject_tool(approval_item)
+                reason = decision_result.get("reason")
+                rejection_message = reason if isinstance(reason, str) and reason else None
+                context_wrapper.reject_tool(
+                    approval_item,
+                    rejection_message=rejection_message,
+                )
         approval_status = context_wrapper.get_approval_status(
             tool_name,
             call_id,
             tool_namespace=tool_namespace,
             existing_pending=approval_item,
             tool_lookup_key=tool_lookup_key,
+            current_invocation=approval_item,
         )
     return approval_status, approval_item
 
@@ -1046,9 +1237,10 @@ async def resolve_approval_rejection_message(
     *,
     context_wrapper: RunContextWrapper[Any],
     run_config: RunConfig,
-    tool_type: Literal["function", "computer", "shell", "apply_patch"],
+    tool_type: Literal["function", "computer", "shell", "apply_patch", "custom"],
     tool_name: str,
     call_id: str,
+    tool_call: Any | None = None,
     tool_namespace: str | None = None,
     tool_lookup_key: FunctionToolLookupKey | None = None,
     existing_pending: ToolApprovalItem | None = None,
@@ -1068,6 +1260,12 @@ async def resolve_approval_rejection_message(
     if formatter is None:
         return REJECTION_MESSAGE
 
+    if tool_call is not None:
+        context_wrapper._mark_tool_invocation_executed(
+            tool_call,
+            tool_lookup_key=tool_lookup_key,
+            tool_name=tool_name,
+        )
     try:
         maybe_message = formatter(
             ToolErrorFormatterArgs(
@@ -1081,18 +1279,25 @@ async def resolve_approval_rejection_message(
         )
         message = await maybe_message if inspect.isawaitable(maybe_message) else maybe_message
     except Exception as exc:
-        logger.error("Tool error formatter failed for %s: %s", tool_name, exc)
+        log_tool_action_error(
+            "Tool error formatter failed",
+            exc,
+            diagnostic_extra=functools.partial(_tool_name_diagnostic_extra, tool_name),
+        )
         return REJECTION_MESSAGE
 
     if message is None:
         return REJECTION_MESSAGE
 
     if not isinstance(message, str):
-        logger.error(
-            "Tool error formatter returned non-string for %s: %s",
-            tool_name,
-            type(message).__name__,
-        )
+        if _debug.DONT_LOG_TOOL_DATA:
+            logger.error("Tool error formatter returned a non-string value")
+        else:
+            logger.error(
+                "Tool error formatter returned non-string for %s: %s",
+                tool_name,
+                type(message).__name__,
+            )
         return REJECTION_MESSAGE
 
     return message
@@ -1102,21 +1307,53 @@ async def function_needs_approval(
     function_tool: FunctionTool,
     context_wrapper: RunContextWrapper[Any],
     tool_call: ResponseFunctionToolCall,
-) -> bool:
-    """Evaluate a function tool's needs_approval setting with parsed args."""
-    parsed_args: dict[str, Any] = {}
-    if callable(function_tool.needs_approval):
-        try:
-            parsed_args = json.loads(tool_call.arguments or "{}")
-        except json.JSONDecodeError:
-            parsed_args = {}
-    needs_approval = await evaluate_needs_approval_setting(
-        function_tool.needs_approval,
-        context_wrapper,
-        parsed_args,
-        tool_call.call_id,
+) -> FunctionToolApproval:
+    """Prepare and evaluate a single function invocation without executing it."""
+    return await evaluate_function_tool_approval(
+        function_tool, context_wrapper, tool_call.arguments, tool_call.call_id
     )
-    return bool(needs_approval)
+
+
+def _classify_hosted_mcp_pending_request(
+    pending: ToolApprovalItem,
+    current_request: Any,
+) -> Literal["reuse_pending", "use_current", "use_current_with_pending_exact", "conflict"]:
+    """Choose the safe identity source when reconciling pending and current requests."""
+    pending_identity = get_hosted_mcp_approval_request_identity(pending)
+    current_identity = get_hosted_mcp_approval_request_identity(current_request)
+    if pending_identity is None or current_identity is None:
+        return "conflict"
+    if pending_identity.request_id is None or current_identity.request_id is None:
+        return "conflict"
+    if pending_identity.request_id != current_identity.request_id:
+        return "conflict"
+    if (
+        pending_identity.server_label is not None
+        and current_identity.server_label is not None
+        and pending_identity.server_label != current_identity.server_label
+    ):
+        return "conflict"
+    pending_tool_name = RunContextWrapper._resolve_hosted_mcp_tool_name(
+        pending,
+        pending_identity,
+    )
+    if (
+        pending_tool_name is not None
+        and current_identity.tool_name is not None
+        and pending_tool_name != current_identity.tool_name
+    ):
+        return "conflict"
+    if (
+        current_identity.approval_identity is None
+        and pending_identity.approval_identity is not None
+    ):
+        return "use_current"
+    if (
+        current_identity.approval_identity is not None
+        and pending_identity.approval_identity is None
+    ):
+        return "use_current_with_pending_exact"
+    return "reuse_pending"
 
 
 def process_hosted_mcp_approvals(
@@ -1133,53 +1370,33 @@ def process_hosted_mcp_approvals(
         if not isinstance(item, ToolApprovalItem):
             continue
         raw = item.raw_item
-        if not _is_hosted_mcp_approval_request(raw):
+        if get_hosted_mcp_approval_request_identity(item) is None:
             continue
         request_id = extract_mcp_request_id(raw)
         if request_id:
             hosted_mcp_approvals_by_id[request_id] = item
 
-    pending_hosted_mcp_approvals: list[ToolApprovalItem] = []
-    pending_hosted_mcp_approval_ids: set[str] = set()
-
-    for mcp_run in mcp_approval_requests:
-        request_id = extract_mcp_request_id_from_run(mcp_run)
-        # MCP approval requests are documented to include an id used as approval_request_id.
-        # See https://platform.openai.com/docs/guides/tools-connectors-mcp#approvals
-        approval_item = hosted_mcp_approvals_by_id.get(request_id) if request_id else None
-        if not approval_item or not request_id:
-            continue
-
-        tool_name = RunContextWrapper._resolve_tool_name(approval_item)
-        approved = context_wrapper.get_approval_status(
-            tool_name=tool_name,
-            call_id=request_id,
-            existing_pending=approval_item,
-        )
-
-        if approved is not None:
-            raw_item: McpApprovalResponse = {
-                "type": "mcp_approval_response",
-                "approval_request_id": request_id,
-                "approve": approved,
-            }
-            rejection_message = context_wrapper.get_rejection_message(
-                tool_name=tool_name,
-                call_id=request_id,
-                existing_pending=approval_item,
-            )
-            if approved is False and rejection_message is not None:
-                raw_item["reason"] = rejection_message
-            response_item = MCPApprovalResponseItem(raw_item=raw_item, agent=agent)
-            append_item(response_item)
-            continue
-
-        if approval_item not in pending_hosted_mcp_approvals:
-            pending_hosted_mcp_approvals.append(approval_item)
-        pending_hosted_mcp_approval_ids.add(request_id)
-        append_item(approval_item)
-
-    return pending_hosted_mcp_approvals, pending_hosted_mcp_approval_ids
+    resumed_requests = [
+        request
+        for request in mcp_approval_requests
+        if extract_mcp_request_id_from_run(request) in hosted_mcp_approvals_by_id
+    ]
+    responses, pending = collect_manual_mcp_approvals(
+        agent=agent,
+        requests=resumed_requests,
+        context_wrapper=context_wrapper,
+        existing_pending_by_call_id=hosted_mcp_approvals_by_id,
+    )
+    for item in responses:
+        append_item(item)
+    for item in pending:
+        append_item(item)
+    pending_ids = {
+        request_id
+        for item in pending
+        if (request_id := extract_mcp_request_id(item.raw_item)) is not None
+    }
+    return pending, pending_ids
 
 
 def collect_manual_mcp_approvals(
@@ -1208,10 +1425,68 @@ def collect_manual_mcp_approvals(
         tool_name = RunContextWrapper._to_str_or_none(getattr(request_item, "name", None))
         tool_name = tool_name or get_mapping_or_attr(request, "mcp_tool").name
 
-        existing_pending = pending_lookup.get(request_id or "")
-        approval_status = context_wrapper.get_approval_status(
-            tool_name, request_id or "", existing_pending=existing_pending
+        current_approval_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=request_item,
+            tool_name=tool_name,
         )
+        existing_pending = pending_lookup.get(request_id or "")
+        if existing_pending is not None:
+            context_wrapper._restore_pending_approval_binding(existing_pending)
+        binding_status = context_wrapper._approved_tool_invocation_status(
+            current_approval_item.raw_item
+        )
+        pending_resolution = (
+            _classify_hosted_mcp_pending_request(existing_pending, request_item)
+            if existing_pending is not None
+            else "use_current"
+        )
+        identity_mismatch = pending_resolution == "conflict"
+        if existing_pending is not None and pending_resolution == "reuse_pending":
+            approval_item = existing_pending
+        else:
+            approval_item = current_approval_item
+        allow_primary_legacy = (
+            existing_pending is not None
+            and not identity_mismatch
+            and pending_resolution != "use_current_with_pending_exact"
+        )
+        approval_status, rejection_message = context_wrapper._resolve_hosted_mcp_approval_decision(
+            approval_item,
+            allow_legacy_exact=allow_primary_legacy,
+        )
+        if (
+            approval_status is None
+            and existing_pending is not None
+            and pending_resolution == "use_current_with_pending_exact"
+        ):
+            approval_status, rejection_message = (
+                context_wrapper._resolve_hosted_mcp_approval_decision(
+                    existing_pending,
+                    allow_legacy_exact=True,
+                )
+            )
+        if approval_status is None and pending_resolution == "use_current_with_pending_exact":
+            approval_status, rejection_message = (
+                context_wrapper._resolve_hosted_mcp_approval_decision(
+                    current_approval_item,
+                    allow_legacy_exact=True,
+                )
+            )
+
+        if approval_status is not None and binding_status is None:
+            binding_status = context_wrapper._approved_tool_invocation_status(
+                current_approval_item.raw_item
+            )
+
+        if binding_status is None:
+            approval_item = current_approval_item
+
+        if approval_status is not None and request_id:
+            if binding_status is None:
+                approval_status = None
+            elif binding_status[1]:
+                continue
 
         if approval_status is not None and request_id:
             approval_response_raw: McpApprovalResponse = {
@@ -1219,27 +1494,16 @@ def collect_manual_mcp_approvals(
                 "approval_request_id": request_id,
                 "approve": approval_status,
             }
-            rejection_message = context_wrapper.get_rejection_message(
-                tool_name,
-                request_id,
-                existing_pending=existing_pending,
-            )
             if approval_status is False and rejection_message is not None:
                 approval_response_raw["reason"] = rejection_message
+            ItemHelpers.copy_tool_call_caller(request_item, approval_response_raw)
             approved.append(MCPApprovalResponseItem(raw_item=approval_response_raw, agent=agent))
             continue
 
         if approval_status is not None:
             continue
 
-        pending.append(
-            existing_pending
-            or ToolApprovalItem(
-                agent=agent,
-                raw_item=request_item,
-                tool_name=tool_name,
-            )
-        )
+        pending.append(approval_item)
 
     return approved, pending
 
@@ -1250,7 +1514,7 @@ def index_approval_items_by_call_id(items: Sequence[RunItem]) -> dict[str, ToolA
     for item in items:
         if not isinstance(item, ToolApprovalItem):
             continue
-        call_id = extract_tool_call_id(item.raw_item)
+        call_id = get_tool_approval_item_call_id(item)
         if call_id:
             approvals[call_id] = item
     return approvals
@@ -1265,12 +1529,20 @@ def should_keep_hosted_mcp_item(
     """Keep only hosted MCP approvals that match pending requests from the provider."""
     if not isinstance(item, ToolApprovalItem):
         return True
-    if not _is_hosted_mcp_approval_request(item.raw_item):
+    if get_hosted_mcp_approval_request_identity(item) is None:
         return False
     request_id = extract_mcp_request_id(item.raw_item)
     return item in pending_hosted_mcp_approvals or (
         request_id is not None and request_id in pending_hosted_mcp_approval_ids
     )
+
+
+def _uses_programmatic_output_schema(
+    function_tool: FunctionTool,
+    tool_call: Any,
+) -> bool:
+    """Return whether this call must satisfy its advertised program output schema."""
+    return function_tool.output_json_schema is not None and _is_programmatic_tool_call(tool_call)
 
 
 class _FunctionToolBatchExecutor:
@@ -1279,14 +1551,20 @@ class _FunctionToolBatchExecutor:
     def __init__(
         self,
         *,
-        agent: Agent[Any],
+        bindings: AgentBindings[Any],
         tool_runs: list[ToolRunFunction],
         hooks: RunHooks[Any],
         context_wrapper: RunContextWrapper[Any],
         config: RunConfig,
         isolate_parallel_failures: bool | None,
+        sibling_category_failure: asyncio.Event | None,
+        on_tool_error_selected: Callable[[], None] | None,
+        tool_output_committer: Callable[[RunItem], None] | None,
+        tool_input_guardrail_results: list[ToolInputGuardrailResult] | None,
+        tool_output_guardrail_results: list[ToolOutputGuardrailResult] | None,
     ) -> None:
-        self.agent = agent
+        self.execution_agent = bindings.execution_agent
+        self.public_agent = bindings.public_agent
         self.tool_runs = tool_runs
         self.hooks = hooks
         self.context_wrapper = context_wrapper
@@ -1294,15 +1572,30 @@ class _FunctionToolBatchExecutor:
         self.isolate_parallel_failures = (
             len(tool_runs) > 1 if isolate_parallel_failures is None else isolate_parallel_failures
         )
-        self.tool_input_guardrail_results: list[ToolInputGuardrailResult] = []
-        self.tool_output_guardrail_results: list[ToolOutputGuardrailResult] = []
+        self.sibling_category_failure = sibling_category_failure
+        self.on_tool_error_selected = on_tool_error_selected
+        self.tool_output_committer = tool_output_committer
+        self.tool_input_guardrail_results = (
+            tool_input_guardrail_results if tool_input_guardrail_results is not None else []
+        )
+        self.tool_output_guardrail_results = (
+            tool_output_guardrail_results if tool_output_guardrail_results is not None else []
+        )
         self.tool_state_scope_id = get_agent_tool_state_scope(context_wrapper)
         self.task_states: dict[asyncio.Task[Any], _FunctionToolTaskState] = {}
         self.teardown_cancelled_tasks: set[asyncio.Task[Any]] = set()
         self.results_by_tool_run: dict[int, Any] = {}
+        self.schema_bypassed_tool_runs: set[int] = set()
+        self.custom_data_by_tool_run: dict[int, dict[str, Any]] = {}
+        self.output_items_by_tool_run: dict[int, ToolCallOutputItem] = {}
         self.pending_tasks: set[asyncio.Task[Any]] = set()
         self.propagating_failure: BaseException | None = None
         self.available_function_tools: list[FunctionTool] = []
+        self.max_function_tool_concurrency = (
+            config.tool_execution.max_function_tool_concurrency
+            if config.tool_execution is not None
+            else None
+        )
 
     async def execute(
         self,
@@ -1310,21 +1603,40 @@ class _FunctionToolBatchExecutor:
         list[FunctionToolResult], list[ToolInputGuardrailResult], list[ToolOutputGuardrailResult]
     ]:
         self.available_function_tools = await resolve_enabled_function_tools(
-            self.agent,
+            self.execution_agent,
             self.context_wrapper,
         )
+        enabled_function_tool_ids = {id(tool) for tool in self.available_function_tools}
+        configured_function_tool_ids = {
+            id(tool) for tool in self.execution_agent.tools if isinstance(tool, FunctionTool)
+        }
         for tool_run in self.tool_runs:
-            if tool_run.function_tool not in self.available_function_tools:
+            function_tool = tool_run.function_tool
+            function_tool_id = id(function_tool)
+            if (
+                function_tool_id in configured_function_tool_ids
+                and function_tool_id not in enabled_function_tool_ids
+            ):
+                raise ModelBehaviorError(
+                    f"Tool {function_tool.name} is currently disabled for agent "
+                    f"{self.public_agent.name}."
+                )
+            if function_tool_id not in enabled_function_tool_ids:
                 self.available_function_tools.append(tool_run.function_tool)
-        for order, tool_run in enumerate(self.tool_runs):
-            self._create_tool_task(tool_run, order)
+                enabled_function_tool_ids.add(function_tool_id)
+        pending_tool_runs = deque(enumerate(self.tool_runs))
+        self._fill_tool_task_slots(pending_tool_runs)
 
         try:
-            await self._drain_pending_tasks()
+            await self._drain_pending_tasks(pending_tool_runs)
         except asyncio.CancelledError as exc:
             if self.propagating_failure is exc:
+                _mark_tool_local_cancellation(exc)
                 raise
-            self._cancel_pending_tasks_for_parent_cancellation()
+            if self.sibling_category_failure is not None and self.sibling_category_failure.is_set():
+                await self._drain_pending_tasks_for_sibling_category_failure()
+            else:
+                self._cancel_pending_tasks_for_parent_cancellation()
             raise
 
         return (
@@ -1332,6 +1644,18 @@ class _FunctionToolBatchExecutor:
             self.tool_input_guardrail_results,
             self.tool_output_guardrail_results,
         )
+
+    def _fill_tool_task_slots(self, pending_tool_runs: deque[tuple[int, ToolRunFunction]]) -> None:
+        max_concurrency = self.max_function_tool_concurrency
+        available_slots = (
+            len(pending_tool_runs)
+            if max_concurrency is None
+            else max_concurrency - len(self.pending_tasks)
+        )
+        while available_slots > 0 and pending_tool_runs:
+            order, tool_run = pending_tool_runs.popleft()
+            self._create_tool_task(tool_run, order)
+            available_slots -= 1
 
     def _create_tool_task(self, tool_run: ToolRunFunction, order: int) -> None:
         task_state = _FunctionToolTaskState(tool_run=tool_run, order=order)
@@ -1345,7 +1669,10 @@ class _FunctionToolBatchExecutor:
         self.task_states[task] = task_state
         self.pending_tasks.add(task)
 
-    async def _drain_pending_tasks(self) -> None:
+    async def _drain_pending_tasks(
+        self,
+        pending_tool_runs: deque[tuple[int, ToolRunFunction]],
+    ) -> None:
         while self.pending_tasks:
             done_tasks, self.pending_tasks = await asyncio.wait(
                 self.pending_tasks,
@@ -1358,11 +1685,14 @@ class _FunctionToolBatchExecutor:
             )
             if failure is not None:
                 await self._raise_failure_after_draining_siblings(failure)
+            self._fill_tool_task_slots(pending_tool_runs)
 
     async def _raise_failure_after_draining_siblings(
         self,
         failure: _FunctionToolFailure,
     ) -> None:
+        if self.on_tool_error_selected is not None:
+            self.on_tool_error_selected()
         cancellable_tasks, post_invoke_tasks = self._partition_pending_tasks()
         self.teardown_cancelled_tasks.update(cancellable_tasks)
         _cancel_function_tool_tasks(cancellable_tasks)
@@ -1427,6 +1757,30 @@ class _FunctionToolBatchExecutor:
             timeout_seconds=_FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS,
         )
 
+    async def _drain_pending_tasks_for_sibling_category_failure(self) -> None:
+        """Settle nested function tasks after another tool category fails."""
+        cancellable_tasks, post_invoke_tasks = self._partition_pending_tasks()
+        self.teardown_cancelled_tasks.update(cancellable_tasks)
+        _cancel_function_tool_tasks(cancellable_tasks)
+
+        try:
+            _, remaining_cancelled_tasks = await self._drain_cancelled_tasks(cancellable_tasks)
+            _, remaining_post_invoke_tasks = await self._wait_post_invoke_tasks(post_invoke_tasks)
+        except BaseException:
+            self._cancel_pending_tasks_for_parent_cancellation()
+            self.pending_tasks = set()
+            raise
+
+        _attach_function_tool_task_result_callbacks(
+            remaining_cancelled_tasks,
+            message_for_exception=_background_cleanup_task_exception_message,
+        )
+        _attach_function_tool_task_result_callbacks(
+            remaining_post_invoke_tasks,
+            message_for_exception=_background_post_invoke_task_exception_message,
+        )
+        self.pending_tasks = set()
+
     def _cancel_pending_tasks_for_parent_cancellation(self) -> None:
         self.teardown_cancelled_tasks.update(self.pending_tasks)
         _cancel_function_tool_tasks(self.pending_tasks)
@@ -1464,10 +1818,10 @@ class _FunctionToolBatchExecutor:
                 tool_call.call_id,
                 tool_call=raw_tool_call,
                 tool_namespace=tool_context_namespace,
-                agent=self.agent,
+                agent=self.public_agent,
                 run_config=self.config,
             )
-            agent_hooks = self.agent.hooks
+            agent_hooks = self.public_agent.hooks
             if self.config.trace_include_sensitive_data:
                 span_fn.span_data.input = tool_call.arguments
 
@@ -1477,6 +1831,8 @@ class _FunctionToolBatchExecutor:
                     tool_call=tool_call,
                     raw_tool_call=raw_tool_call,
                     span_fn=span_fn,
+                    tool_context=tool_context,
+                    approval_evaluation=task_state.tool_run._approval_evaluation,
                 )
                 if approval_result is not None:
                     result = approval_result
@@ -1490,18 +1846,30 @@ class _FunctionToolBatchExecutor:
                         agent_hooks=agent_hooks,
                     )
             except Exception as e:
+                trace_error = get_trace_tool_error(
+                    trace_include_sensitive_data=self.config.trace_include_sensitive_data,
+                    error_message=str(e),
+                )
                 _error_tracing.attach_error_to_current_span(
                     SpanError(
                         message="Error running tool",
-                        data={"tool_name": func_tool.name, "error": str(e)},
+                        data={"tool_name": func_tool.name, "error": trace_error},
                     )
                 )
                 if isinstance(e, AgentsException):
-                    raise e
+                    raise
                 raise UserError(f"Error running tool {func_tool.name}: {e}") from e
+            finally:
+                tool_context._function_tool_arguments = None
+                task_state.tool_run._approval_evaluation = None
 
             if self.config.trace_include_sensitive_data:
-                span_fn.span_data.output = result
+                # Approval short-circuits return the FunctionToolResult wrapper rather than the
+                # tool's own output, so read the output off it the way every other consumer of
+                # this value does (see `_build_function_tool_results`).
+                span_fn.span_data.output = (
+                    result.output if isinstance(result, FunctionToolResult) else result
+                )
             return result
 
     async def _maybe_execute_tool_approval(
@@ -1511,40 +1879,100 @@ class _FunctionToolBatchExecutor:
         tool_call: ResponseFunctionToolCall,
         raw_tool_call: ResponseFunctionToolCall,
         span_fn: Span[Any],
+        tool_context: ToolContext[Any],
+        approval_evaluation: FunctionToolApproval | None,
     ) -> Any | None:
-        needs_approval_result = await function_needs_approval(
-            func_tool,
-            self.context_wrapper,
-            tool_call,
-        )
-        if not needs_approval_result:
-            return None
-
         tool_namespace = get_tool_call_namespace(raw_tool_call)
         if tool_namespace is None and is_deferred_top_level_function_tool(func_tool):
             tool_namespace = func_tool.name
         tool_lookup_key = get_function_tool_lookup_key_for_call(raw_tool_call)
         if is_deferred_top_level_function_tool(func_tool):
             tool_lookup_key = ("deferred_top_level", func_tool.name)
+        current_approval_item = ToolApprovalItem(
+            agent=self.public_agent,
+            raw_item=raw_tool_call,
+            tool_name=func_tool.name,
+            tool_namespace=tool_namespace,
+            tool_origin=get_function_tool_origin(func_tool),
+            tool_lookup_key=tool_lookup_key,
+            _allow_bare_name_alias=should_allow_bare_name_approval_alias(
+                func_tool,
+                self.available_function_tools,
+            ),
+        )
         approval_status = self.context_wrapper.get_approval_status(
             func_tool.name,
             tool_call.call_id,
             tool_namespace=tool_namespace,
             tool_lookup_key=tool_lookup_key,
+            current_invocation=current_approval_item,
         )
+        if approval_evaluation is not None:
+            approval_evaluation.check_invocation(func_tool, tool_call.arguments)
+            if approval_status is not False:
+                tool_context._function_tool_arguments = approval_evaluation.prepared
         if approval_status is None:
-            approval_item = ToolApprovalItem(
-                agent=self.agent,
-                raw_item=raw_tool_call,
-                tool_name=func_tool.name,
+            evaluation = approval_evaluation or await function_needs_approval(
+                func_tool, self.context_wrapper, tool_call
+            )
+            evaluation.check_invocation(func_tool, tool_call.arguments)
+            tool_context._function_tool_arguments = evaluation.prepared
+            approval_status = self.context_wrapper.get_approval_status(
+                func_tool.name,
+                tool_call.call_id,
                 tool_namespace=tool_namespace,
                 tool_lookup_key=tool_lookup_key,
-                _allow_bare_name_alias=should_allow_bare_name_approval_alias(
-                    func_tool,
-                    self.available_function_tools,
-                ),
+                current_invocation=current_approval_item,
             )
-            return FunctionToolResult(tool=func_tool, output=None, run_item=approval_item)
+            if approval_status is None and evaluation.outcome == "invoke":
+                return None
+
+        if approval_status is None:
+            if self._should_run_pre_approval_tool_input_guardrails():
+                tool_context_namespace = get_tool_call_namespace(raw_tool_call)
+                if tool_context_namespace is None:
+                    tool_context_namespace = get_tool_call_namespace(tool_call)
+                tool_context = ToolContext.from_agent_context(
+                    self.context_wrapper,
+                    tool_call.call_id,
+                    tool_call=raw_tool_call,
+                    tool_namespace=tool_context_namespace,
+                    agent=self.public_agent,
+                    run_config=self.config,
+                )
+                rejected_message = await _execute_tool_input_guardrails(
+                    func_tool=func_tool,
+                    tool_context=tool_context,
+                    agent=self.public_agent,
+                    tool_input_guardrail_results=self.tool_input_guardrail_results,
+                )
+                approval_status = self.context_wrapper.get_approval_status(
+                    func_tool.name,
+                    tool_call.call_id,
+                    tool_namespace=tool_namespace,
+                    tool_lookup_key=tool_lookup_key,
+                    current_invocation=current_approval_item,
+                )
+                if approval_status is None and rejected_message is not None:
+                    return FunctionToolResult(
+                        tool=func_tool,
+                        output=rejected_message,
+                        run_item=function_rejection_item(
+                            self.public_agent,
+                            tool_call,
+                            rejection_message=rejected_message,
+                            output_json_schema=func_tool.output_json_schema,
+                            scope_id=self.tool_state_scope_id,
+                            tool_origin=get_function_tool_origin(func_tool),
+                        ),
+                    )
+
+        if approval_status is None:
+            return FunctionToolResult(
+                tool=func_tool,
+                output=None,
+                run_item=current_approval_item,
+            )
 
         if approval_status is not False:
             return None
@@ -1552,15 +1980,23 @@ class _FunctionToolBatchExecutor:
         rejection_message = await resolve_approval_rejection_message(
             context_wrapper=self.context_wrapper,
             run_config=self.config,
+            tool_call=tool_call,
             tool_type="function",
             tool_name=tool_trace_name(func_tool.name, tool_namespace) or func_tool.name,
             call_id=tool_call.call_id,
             tool_namespace=tool_namespace,
             tool_lookup_key=tool_lookup_key,
+            existing_pending=current_approval_item,
         )
         span_fn.set_error(
             SpanError(
-                message=rejection_message,
+                # The rejection message is app-supplied text, so it reaches the exported span
+                # under the same sensitive-data gate as the tool output above.
+                message=_error_tracing.get_trace_error(
+                    trace_include_sensitive_data=self.config.trace_include_sensitive_data,
+                    error_message=rejection_message,
+                    redacted_message="Tool execution rejected",
+                ),
                 data={
                     "tool_name": func_tool.name,
                     "error": (
@@ -1569,15 +2005,16 @@ class _FunctionToolBatchExecutor:
                 },
             )
         )
-        span_fn.span_data.output = rejection_message
         return FunctionToolResult(
             tool=func_tool,
             output=rejection_message,
             run_item=function_rejection_item(
-                self.agent,
+                self.public_agent,
                 tool_call,
                 rejection_message=rejection_message,
+                output_json_schema=func_tool.output_json_schema,
                 scope_id=self.tool_state_scope_id,
+                tool_origin=get_function_tool_origin(func_tool),
             ),
         )
 
@@ -1591,23 +2028,34 @@ class _FunctionToolBatchExecutor:
         tool_context: ToolContext[Any],
         agent_hooks: Any,
     ) -> Any:
-        rejected_message = await _execute_tool_input_guardrails(
-            func_tool=func_tool,
-            tool_context=tool_context,
-            agent=self.agent,
-            tool_input_guardrail_results=self.tool_input_guardrail_results,
+        pending_nested_result = peek_agent_tool_run_result(
+            task_state.tool_run.tool_call,
+            scope_id=self.tool_state_scope_id,
         )
-        if rejected_message is not None:
-            return rejected_message
+        is_nested_continuation = bool(self._get_nested_tool_interruptions(pending_nested_result))
+        if not is_nested_continuation:
+            self.context_wrapper._mark_tool_invocation_executed(
+                tool_call,
+                tool_lookup_key=get_function_tool_lookup_key_for_tool(func_tool),
+            )
+            rejected_message = await _execute_tool_input_guardrails(
+                func_tool=func_tool,
+                tool_context=tool_context,
+                agent=self.public_agent,
+                tool_input_guardrail_results=self.tool_input_guardrail_results,
+            )
+            if rejected_message is not None:
+                self.schema_bypassed_tool_runs.add(id(task_state.tool_run))
+                return rejected_message
 
-        await asyncio.gather(
-            self.hooks.on_tool_start(tool_context, self.agent, func_tool),
-            (
-                agent_hooks.on_tool_start(tool_context, self.agent, func_tool)
-                if agent_hooks
-                else _coro.noop_coroutine()
-            ),
-        )
+            await gather_with_cancel(
+                self.hooks.on_tool_start(tool_context, self.public_agent, func_tool),
+                (
+                    agent_hooks.on_tool_start(tool_context, self.public_agent, func_tool)
+                    if agent_hooks is not None
+                    else _coro.noop_coroutine()
+                ),
+            )
 
         invoke_task = asyncio.create_task(
             self._invoke_tool_and_run_post_invoke(
@@ -1622,6 +2070,12 @@ class _FunctionToolBatchExecutor:
         task_state.invoke_task = invoke_task
         return await self._await_invoke_task(outer_task=outer_task, invoke_task=invoke_task)
 
+    def _should_run_pre_approval_tool_input_guardrails(self) -> bool:
+        tool_execution = self.config.tool_execution
+        if tool_execution is None:
+            return False
+        return tool_execution.pre_approval_tool_input_guardrails
+
     async def _invoke_tool_and_run_post_invoke(
         self,
         *,
@@ -1632,12 +2086,15 @@ class _FunctionToolBatchExecutor:
         tool_context: ToolContext[Any],
         agent_hooks: Any,
     ) -> Any:
+        bypass_output_schema = False
         try:
-            real_result = await invoke_function_tool(
+            invocation_result = await _invoke_function_tool_with_metadata(
                 function_tool=func_tool,
                 context=tool_context,
                 arguments=tool_call.arguments,
             )
+            real_result = invocation_result.output
+            bypass_output_schema = invocation_result.is_sdk_generated_error
         except asyncio.CancelledError as e:
             if outer_task in self.teardown_cancelled_tasks:
                 raise
@@ -1650,29 +2107,92 @@ class _FunctionToolBatchExecutor:
             if result is None:
                 raise
 
+            bypass_output_schema = _consume_function_tool_default_failure(
+                tool_context
+            ) and not _uses_programmatic_output_schema(func_tool, tool_call)
+
+            include_error_detail = (
+                self.config.trace_include_sensitive_data
+                and resolve_function_tool_failure_error_function(func_tool, tool_context)
+                is not default_tool_error_function
+            )
+            trace_error = get_trace_tool_error(
+                trace_include_sensitive_data=include_error_detail,
+                error_message=str(e) if include_error_detail else "",
+            )
             _error_tracing.attach_error_to_current_span(
                 SpanError(
                     message="Tool execution cancelled",
-                    data={"tool_name": func_tool.name, "error": str(e)},
+                    data={"tool_name": func_tool.name, "error": trace_error},
                 )
             )
             real_result = result
 
-        task_state.in_post_invoke_phase = True
+        nested_run_result = peek_agent_tool_run_result(
+            task_state.tool_run.tool_call,
+            scope_id=self.tool_state_scope_id,
+        )
+        nested_interruptions = self._get_nested_tool_interruptions(nested_run_result)
+        if nested_interruptions:
+            return real_result
 
-        final_result = await _execute_tool_output_guardrails(
+        task_state.in_post_invoke_phase = True
+        output_guardrail_result = await _execute_tool_output_guardrails(
             func_tool=func_tool,
             tool_context=tool_context,
-            agent=self.agent,
+            agent=self.public_agent,
             real_result=real_result,
             tool_output_guardrail_results=self.tool_output_guardrail_results,
         )
-
-        await asyncio.gather(
-            self.hooks.on_tool_end(tool_context, self.agent, func_tool, final_result),
+        final_result = output_guardrail_result.output
+        bypass_output_schema = bypass_output_schema or (output_guardrail_result.is_rejection)
+        if bypass_output_schema:
+            self.schema_bypassed_tool_runs.add(id(task_state.tool_run))
+        provider_result = (
+            function_tool_error_output(
+                tool_call,
+                final_result,
+                output_json_schema=func_tool.output_json_schema,
+            )
+            if bypass_output_schema
+            else final_result
+        )
+        raw_output_item = ItemHelpers.tool_call_output_item(
+            tool_call,
+            provider_result,
+            output_json_schema=None if bypass_output_schema else func_tool.output_json_schema,
+            output_type_adapter=None if bypass_output_schema else func_tool._output_type_adapter,
+        )
+        output_item: ToolCallOutputItem | None = None
+        if not nested_interruptions:
+            output_item = ToolCallOutputItem(
+                output=final_result,
+                raw_item=raw_output_item,
+                agent=self.public_agent,
+                tool_origin=get_function_tool_origin(func_tool),
+            )
+            self.output_items_by_tool_run[id(task_state.tool_run)] = output_item
+            if self.tool_output_committer is not None:
+                self.tool_output_committer(output_item)
+        extracted_custom_data = await maybe_extract_custom_data(
+            func_tool.custom_data_extractor,
+            FunctionToolCustomDataContext(
+                tool_context=tool_context,
+                tool=func_tool,
+                output=final_result,
+                raw_item=copy.deepcopy(raw_output_item),
+            ),
+        )
+        custom_data = merge_custom_data(tool_context._custom_data, extracted_custom_data)
+        if custom_data:
+            self.custom_data_by_tool_run[id(task_state.tool_run)] = custom_data
+            if output_item is not None:
+                output_item.custom_data = custom_data
+        await gather_with_cancel(
+            self.hooks.on_tool_end(tool_context, self.public_agent, func_tool, final_result),
             (
-                agent_hooks.on_tool_end(tool_context, self.agent, func_tool, final_result)
-                if agent_hooks
+                agent_hooks.on_tool_end(tool_context, self.public_agent, func_tool, final_result)
+                if agent_hooks is not None
                 else _coro.noop_coroutine()
             ),
         )
@@ -1766,14 +2286,41 @@ class _FunctionToolBatchExecutor:
                 continue
 
             nested_run_result, nested_interruptions = self._resolve_nested_tool_run_result(tool_run)
+            bypass_output_schema = id(tool_run) in self.schema_bypassed_tool_runs
 
             run_item: RunItem | None
             if not nested_interruptions:
-                run_item = ToolCallOutputItem(
-                    output=result,
-                    raw_item=ItemHelpers.tool_call_output_item(tool_run.tool_call, result),
-                    agent=self.agent,
-                )
+                run_item = self.output_items_by_tool_run.get(id(tool_run))
+                if run_item is None:
+                    provider_result = (
+                        function_tool_error_output(
+                            tool_run.tool_call,
+                            result,
+                            output_json_schema=tool_run.function_tool.output_json_schema,
+                        )
+                        if bypass_output_schema
+                        else result
+                    )
+                    run_item = ToolCallOutputItem(
+                        output=result,
+                        raw_item=ItemHelpers.tool_call_output_item(
+                            tool_run.tool_call,
+                            provider_result,
+                            output_json_schema=(
+                                None
+                                if bypass_output_schema
+                                else tool_run.function_tool.output_json_schema
+                            ),
+                            output_type_adapter=(
+                                None
+                                if bypass_output_schema
+                                else tool_run.function_tool._output_type_adapter
+                            ),
+                        ),
+                        agent=self.public_agent,
+                        tool_origin=get_function_tool_origin(tool_run.function_tool),
+                        custom_data=self.custom_data_by_tool_run.get(id(tool_run)),
+                    )
             else:
                 # Skip tool output until nested interruptions are resolved.
                 run_item = None
@@ -1793,33 +2340,106 @@ class _FunctionToolBatchExecutor:
 
 async def execute_function_tool_calls(
     *,
-    agent: Agent[Any],
+    bindings: AgentBindings[Any],
     tool_runs: list[ToolRunFunction],
     hooks: RunHooks[Any],
     context_wrapper: RunContextWrapper[Any],
     config: RunConfig,
     isolate_parallel_failures: bool | None = None,
+    sibling_category_failure: asyncio.Event | None = None,
+    on_tool_error_selected: Callable[[], None] | None = None,
+    tool_output_committer: Callable[[RunItem], None] | None = None,
+    tool_input_guardrail_results: list[ToolInputGuardrailResult] | None = None,
+    tool_output_guardrail_results: list[ToolOutputGuardrailResult] | None = None,
 ) -> tuple[
     list[FunctionToolResult], list[ToolInputGuardrailResult], list[ToolOutputGuardrailResult]
 ]:
     """Execute function tool calls with approvals, guardrails, and hooks."""
     return await _FunctionToolBatchExecutor(
-        agent=agent,
+        bindings=bindings,
         tool_runs=tool_runs,
         hooks=hooks,
         context_wrapper=context_wrapper,
         config=config,
         isolate_parallel_failures=isolate_parallel_failures,
+        sibling_category_failure=sibling_category_failure,
+        on_tool_error_selected=on_tool_error_selected,
+        tool_output_committer=tool_output_committer,
+        tool_input_guardrail_results=tool_input_guardrail_results,
+        tool_output_guardrail_results=tool_output_guardrail_results,
     ).execute()
+
+
+async def run_native_tool_post_invoke(
+    post_invoke: Awaitable[None],
+    sibling_category_failure: asyncio.Event | None,
+) -> None:
+    """Settle native output finalization on sibling failure without delaying parent cancellation."""
+    if sibling_category_failure is None:
+        await post_invoke
+        return
+
+    task = asyncio.ensure_future(post_invoke)
+    task.add_done_callback(_consume_future_exception)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if sibling_category_failure.is_set():
+            try:
+                _, pending = await asyncio.wait(
+                    (task,), timeout=_FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS
+                )
+                if pending:
+                    task.cancel()
+                    # Bound cancellation cleanup too: application hooks may suppress cancellation.
+                    await asyncio.wait((task,), timeout=_FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS)
+            except BaseException:
+                task.cancel()
+                raise
+        else:
+            task.cancel()
+        # Do not start the next native invocation after the category was cancelled.
+        raise
+
+
+async def execute_custom_tool_calls(
+    *,
+    public_agent: Agent[Any],
+    calls: list[ToolRunCustom],
+    context_wrapper: RunContextWrapper[Any],
+    hooks: RunHooks[Any],
+    config: RunConfig,
+    tool_output_committer: Callable[[RunItem], None] | None = None,
+    sibling_category_failure: asyncio.Event | None = None,
+) -> list[RunItem]:
+    """Run Responses custom tool calls serially and wrap outputs."""
+    from .tool_actions import CustomToolAction
+
+    results: list[RunItem] = []
+    for call in calls:
+        results.append(
+            await CustomToolAction.execute(
+                agent=public_agent,
+                call=call,
+                hooks=hooks,
+                context_wrapper=context_wrapper,
+                config=config,
+                tool_output_committer=tool_output_committer,
+                sibling_category_failure=sibling_category_failure,
+            )
+        )
+    return results
 
 
 async def execute_local_shell_calls(
     *,
-    agent: Agent[Any],
+    public_agent: Agent[Any],
     calls: list[ToolRunLocalShellCall],
     context_wrapper: RunContextWrapper[Any],
     hooks: RunHooks[Any],
     config: RunConfig,
+    tool_output_committer: Callable[[RunItem], None] | None = None,
+    sibling_category_failure: asyncio.Event | None = None,
 ) -> list[RunItem]:
     """Run local shell tool calls serially and wrap outputs."""
     from .tool_actions import LocalShellAction
@@ -1828,11 +2448,13 @@ async def execute_local_shell_calls(
     for call in calls:
         results.append(
             await LocalShellAction.execute(
-                agent=agent,
+                agent=public_agent,
                 call=call,
                 hooks=hooks,
                 context_wrapper=context_wrapper,
                 config=config,
+                tool_output_committer=tool_output_committer,
+                sibling_category_failure=sibling_category_failure,
             )
         )
     return results
@@ -1840,11 +2462,13 @@ async def execute_local_shell_calls(
 
 async def execute_shell_calls(
     *,
-    agent: Agent[Any],
+    public_agent: Agent[Any],
     calls: list[ToolRunShellCall],
     context_wrapper: RunContextWrapper[Any],
     hooks: RunHooks[Any],
     config: RunConfig,
+    tool_output_committer: Callable[[RunItem], None] | None = None,
+    sibling_category_failure: asyncio.Event | None = None,
 ) -> list[RunItem]:
     """Run shell tool calls serially and wrap outputs."""
     from .tool_actions import ShellAction
@@ -1853,11 +2477,13 @@ async def execute_shell_calls(
     for call in calls:
         results.append(
             await ShellAction.execute(
-                agent=agent,
+                agent=public_agent,
                 call=call,
                 hooks=hooks,
                 context_wrapper=context_wrapper,
                 config=config,
+                tool_output_committer=tool_output_committer,
+                sibling_category_failure=sibling_category_failure,
             )
         )
     return results
@@ -1865,11 +2491,13 @@ async def execute_shell_calls(
 
 async def execute_apply_patch_calls(
     *,
-    agent: Agent[Any],
+    public_agent: Agent[Any],
     calls: list[ToolRunApplyPatchCall],
     context_wrapper: RunContextWrapper[Any],
     hooks: RunHooks[Any],
     config: RunConfig,
+    tool_output_committer: Callable[[RunItem], None] | None = None,
+    sibling_category_failure: asyncio.Event | None = None,
 ) -> list[RunItem]:
     """Run apply_patch tool calls serially and normalize outputs."""
     from .tool_actions import ApplyPatchAction
@@ -1878,11 +2506,13 @@ async def execute_apply_patch_calls(
     for call in calls:
         results.append(
             await ApplyPatchAction.execute(
-                agent=agent,
+                agent=public_agent,
                 call=call,
                 hooks=hooks,
                 context_wrapper=context_wrapper,
                 config=config,
+                tool_output_committer=tool_output_committer,
+                sibling_category_failure=sibling_category_failure,
             )
         )
     return results
@@ -1890,24 +2520,33 @@ async def execute_apply_patch_calls(
 
 async def execute_computer_actions(
     *,
-    agent: Agent[Any],
+    public_agent: Agent[Any],
     actions: list[ToolRunComputerAction],
     hooks: RunHooks[Any],
     context_wrapper: RunContextWrapper[Any],
     config: RunConfig,
+    tool_output_committer: Callable[[RunItem], None] | None = None,
+    sibling_category_failure: asyncio.Event | None = None,
 ) -> list[RunItem]:
     """Run computer actions serially and emit screenshot outputs."""
     from .tool_actions import ComputerAction
 
     results: list[RunItem] = []
     for action in actions:
+        context_wrapper._mark_tool_invocation_executed(
+            action.tool_call,
+            tool_name=action.computer_tool.name,
+        )
         acknowledged: list[ComputerCallOutputAcknowledgedSafetyCheck] | None = None
-        if action.tool_call.pending_safety_checks and action.computer_tool.on_safety_check:
+        if (
+            action.tool_call.pending_safety_checks
+            and action.computer_tool.on_safety_check is not None
+        ):
             acknowledged = []
             for check in action.tool_call.pending_safety_checks:
                 data = ComputerToolSafetyCheckData(
                     ctx_wrapper=context_wrapper,
-                    agent=agent,
+                    agent=public_agent,
                     tool_call=action.tool_call,
                     safety_check=check,
                 )
@@ -1923,15 +2562,23 @@ async def execute_computer_actions(
                     )
                 else:
                     raise UserError("Computer tool safety check was not acknowledged")
+        elif action.tool_call.pending_safety_checks:
+            logger.warning(
+                "Computer call has pending safety checks, but no on_safety_check handler is "
+                "configured. The action will proceed without acknowledging the checks. "
+                "Configure ComputerTool.on_safety_check to review or reject them."
+            )
 
         results.append(
             await ComputerAction.execute(
-                agent=agent,
+                agent=public_agent,
                 action=action,
                 hooks=hooks,
                 context_wrapper=context_wrapper,
                 config=config,
                 acknowledged_safety_checks=acknowledged,
+                tool_output_committer=tool_output_committer,
+                sibling_category_failure=sibling_category_failure,
             )
         )
 
@@ -1964,7 +2611,14 @@ async def execute_approved_tools(
             if isinstance(tool_name, str) and tool_name:
                 tool_map[tool_name] = tool
 
-    def _append_error(message: str, *, tool_call: Any, tool_name: str, call_id: str) -> None:
+    def _append_error(
+        message: str,
+        *,
+        tool_call: Any,
+        tool_name: str,
+        call_id: str,
+        tool_origin: ToolOrigin | None = None,
+    ) -> None:
         append_approval_error_output(
             message=message,
             tool_call=tool_call,
@@ -1972,6 +2626,7 @@ async def execute_approved_tools(
             call_id=call_id,
             generated_items=generated_items,
             agent=agent,
+            tool_origin=tool_origin,
         )
 
     async def _resolve_tool_run(
@@ -1999,14 +2654,25 @@ async def execute_approved_tools(
 
         call_id = extract_tool_call_id(tool_call)
         if not call_id:
+            resolved_tool = tool_map.get(approval_key) if approval_key is not None else None
+            if resolved_tool is None and tool_namespace is None:
+                resolved_tool = tool_map.get(tool_name)
             _append_error(
                 message="Tool approval item missing call ID.",
                 tool_call=tool_call,
                 tool_name=tool_name,
                 call_id="unknown",
+                tool_origin=(
+                    get_function_tool_origin(resolved_tool)
+                    if isinstance(resolved_tool, FunctionTool)
+                    else None
+                ),
             )
             return None
 
+        resolved_tool = tool_map.get(approval_key) if approval_key is not None else None
+        if resolved_tool is None and tool_namespace is None:
+            resolved_tool = tool_map.get(tool_name)
         approval_status = context_wrapper.get_approval_status(
             tool_name,
             call_id,
@@ -2015,14 +2681,12 @@ async def execute_approved_tools(
             tool_lookup_key=tool_lookup_key,
         )
         if approval_status is False:
-            resolved_tool = tool_map.get(approval_key) if approval_key is not None else None
-            if resolved_tool is None and tool_namespace is None:
-                resolved_tool = tool_map.get(tool_name)
             message = REJECTION_MESSAGE
             if isinstance(resolved_tool, FunctionTool):
                 message = await resolve_approval_rejection_message(
                     context_wrapper=context_wrapper,
                     run_config=run_config,
+                    tool_call=tool_call,
                     tool_type="function",
                     tool_name=display_tool_name,
                     call_id=call_id,
@@ -2035,6 +2699,11 @@ async def execute_approved_tools(
                 tool_call=tool_call,
                 tool_name=tool_name,
                 call_id=call_id,
+                tool_origin=(
+                    get_function_tool_origin(resolved_tool)
+                    if isinstance(resolved_tool, FunctionTool)
+                    else None
+                ),
             )
             return None
 
@@ -2044,12 +2713,15 @@ async def execute_approved_tools(
                 tool_call=tool_call,
                 tool_name=tool_name,
                 call_id=call_id,
+                tool_origin=(
+                    get_function_tool_origin(resolved_tool)
+                    if isinstance(resolved_tool, FunctionTool)
+                    else None
+                ),
             )
             return None
 
-        tool = tool_map.get(approval_key) if approval_key is not None else None
-        if tool is None and tool_namespace is None:
-            tool = tool_map.get(tool_name)
+        tool = resolved_tool
         if tool is None:
             _append_error(
                 message=f"Tool '{display_tool_name}' not found.",
@@ -2090,7 +2762,7 @@ async def execute_approved_tools(
 
     if tool_runs:
         function_results, _, _ = await execute_function_tool_calls(
-            agent=agent,
+            bindings=bind_public_agent(agent),
             tool_runs=tool_runs,
             hooks=hooks,
             context_wrapper=context_wrapper,
@@ -2147,10 +2819,10 @@ async def _execute_tool_output_guardrails(
     agent: Agent[Any],
     real_result: Any,
     tool_output_guardrail_results: list[ToolOutputGuardrailResult],
-) -> Any:
+) -> _ToolOutputGuardrailExecutionResult:
     """Execute output guardrails for a tool call and return the final result."""
     if not func_tool.tool_output_guardrails:
-        return real_result
+        return _ToolOutputGuardrailExecutionResult(real_result)
 
     final_result = real_result
     for output_guardrail in func_tool.tool_output_guardrails:
@@ -2172,10 +2844,12 @@ async def _execute_tool_output_guardrails(
         if gr_out.behavior["type"] == "raise_exception":
             raise ToolOutputGuardrailTripwireTriggered(guardrail=output_guardrail, output=gr_out)
         elif gr_out.behavior["type"] == "reject_content":
-            final_result = gr_out.behavior["message"]
-            break
+            return _ToolOutputGuardrailExecutionResult(
+                gr_out.behavior["message"],
+                is_rejection=True,
+            )
 
-    return final_result
+    return _ToolOutputGuardrailExecutionResult(final_result)
 
 
 def _normalize_exit_code(value: Any) -> int | None:
@@ -2186,16 +2860,3 @@ def _normalize_exit_code(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _is_hosted_mcp_approval_request(raw_item: Any) -> bool:
-    """Detect hosted MCP approval request payloads emitted by the provider."""
-    if isinstance(raw_item, McpApprovalRequest):
-        return True
-    if not isinstance(raw_item, dict):
-        return False
-    provider_data = raw_item.get("provider_data", {})
-    return (
-        raw_item.get("type") == "hosted_tool_call"
-        and provider_data.get("type") == "mcp_approval_request"
-    )

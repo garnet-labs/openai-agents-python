@@ -11,9 +11,10 @@ from agents.agent import Agent
 from agents.lifecycle import AgentHooks
 from agents.run import Runner
 from agents.run_context import AgentHookContext, RunContextWrapper, TContext
+from agents.testing import ScriptedModel
 from agents.tool import Tool
+from agents.tool_context import ToolContext
 
-from .fake_model import FakeModel
 from .test_responses import (
     get_final_output_message,
     get_function_tool,
@@ -26,9 +27,11 @@ from .test_responses import (
 class AgentHooksForTests(AgentHooks):
     def __init__(self):
         self.events: dict[str, int] = defaultdict(int)
+        self.tool_context_ids: list[str] = []
 
     def reset(self):
         self.events.clear()
+        self.tool_context_ids.clear()
 
     async def on_start(self, context: AgentHookContext[TContext], agent: Agent[TContext]) -> None:
         self.events["on_start"] += 1
@@ -56,21 +59,57 @@ class AgentHooksForTests(AgentHooks):
         tool: Tool,
     ) -> None:
         self.events["on_tool_start"] += 1
+        if isinstance(context, ToolContext):
+            self.tool_context_ids.append(context.tool_call_id)
 
     async def on_tool_end(
         self,
         context: RunContextWrapper[TContext],
         agent: Agent[TContext],
         tool: Tool,
-        result: str,
+        result: object,
     ) -> None:
         self.events["on_tool_end"] += 1
+        if isinstance(context, ToolContext):
+            self.tool_context_ids.append(context.tool_call_id)
+
+
+class FalsyAgentHooks(AgentHooksForTests):
+    def __bool__(self) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_falsy_agent_hooks_are_invoked() -> None:
+    hooks = FalsyAgentHooks()
+    model = ScriptedModel()
+    agent = Agent(
+        name="test",
+        model=model,
+        tools=[get_function_tool("some_function", "result")],
+        hooks=hooks,
+    )
+    model.extend(
+        [
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
+            [get_text_message("done")],
+        ]
+    )
+
+    await Runner.run(agent, input="user_message")
+
+    assert hooks.events == {
+        "on_start": 1,
+        "on_tool_start": 1,
+        "on_tool_end": 1,
+        "on_end": 1,
+    }
 
 
 @pytest.mark.asyncio
 async def test_non_streamed_agent_hooks():
     hooks = AgentHooksForTests()
-    model = FakeModel()
+    model = ScriptedModel()
     agent_1 = Agent(
         name="test_1",
         model=model,
@@ -89,12 +128,23 @@ async def test_non_streamed_agent_hooks():
 
     agent_1.handoffs.append(agent_3)
 
-    model.set_next_output([get_text_message("user_message")])
+    model.enqueue([get_text_message("user_message")])
     output = await Runner.run(agent_3, input="user_message")
     assert hooks.events == {"on_start": 1, "on_end": 1}, f"{output}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
+        [
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_1")],
+            [get_text_message("done")],
+        ]
+    )
+    await Runner.run(agent_3, input="user_message")
+    assert len(hooks.tool_context_ids) == 2
+    assert len(set(hooks.tool_context_ids)) == 1
+    hooks.reset()
+
+    model.extend(
         [
             # First turn: a tool call
             [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
@@ -115,14 +165,14 @@ async def test_non_streamed_agent_hooks():
     }, f"got unexpected event count: {hooks.events}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
-            [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_1")],
             # Second turn: a message, another tool call, and a handoff
             [
                 get_text_message("a_message"),
-                get_function_tool_call("some_function", json.dumps({"a": "b"})),
+                get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_2"),
                 get_handoff_tool_call(agent_1),
             ],
             # Third turn: a message and a handoff back to the orig agent
@@ -146,7 +196,7 @@ async def test_non_streamed_agent_hooks():
 @pytest.mark.asyncio
 async def test_streamed_agent_hooks():
     hooks = AgentHooksForTests()
-    model = FakeModel()
+    model = ScriptedModel()
     agent_1 = Agent(name="test_1", model=model)
     agent_2 = Agent(name="test_2", model=model)
     agent_3 = Agent(
@@ -159,14 +209,14 @@ async def test_streamed_agent_hooks():
 
     agent_1.handoffs.append(agent_3)
 
-    model.set_next_output([get_text_message("user_message")])
+    model.enqueue([get_text_message("user_message")])
     output = Runner.run_streamed(agent_3, input="user_message")
     async for _ in output.stream_events():
         pass
     assert hooks.events == {"on_start": 1, "on_end": 1}, f"{output}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
             [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
@@ -189,14 +239,14 @@ async def test_streamed_agent_hooks():
     }, f"got unexpected event count: {hooks.events}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
-            [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_1")],
             # Second turn: a message, another tool call, and a handoff
             [
                 get_text_message("a_message"),
-                get_function_tool_call("some_function", json.dumps({"a": "b"})),
+                get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_2"),
                 get_handoff_tool_call(agent_1),
             ],
             # Third turn: a message and a handoff back to the orig agent
@@ -226,7 +276,7 @@ class Foo(TypedDict):
 @pytest.mark.asyncio
 async def test_structured_output_non_streamed_agent_hooks():
     hooks = AgentHooksForTests()
-    model = FakeModel()
+    model = ScriptedModel()
     agent_1 = Agent(name="test_1", model=model)
     agent_2 = Agent(name="test_2", model=model)
     agent_3 = Agent(
@@ -240,12 +290,12 @@ async def test_structured_output_non_streamed_agent_hooks():
 
     agent_1.handoffs.append(agent_3)
 
-    model.set_next_output([get_final_output_message(json.dumps({"a": "b"}))])
+    model.enqueue([get_final_output_message(json.dumps({"a": "b"}))])
     output = await Runner.run(agent_3, input="user_message")
     assert hooks.events == {"on_start": 1, "on_end": 1}, f"{output}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
             [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
@@ -266,14 +316,14 @@ async def test_structured_output_non_streamed_agent_hooks():
     }, f"got unexpected event count: {hooks.events}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
-            [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_1")],
             # Second turn: a message, another tool call, and a handoff
             [
                 get_text_message("a_message"),
-                get_function_tool_call("some_function", json.dumps({"a": "b"})),
+                get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_2"),
                 get_handoff_tool_call(agent_1),
             ],
             # Third turn: a message and a handoff back to the orig agent
@@ -297,7 +347,7 @@ async def test_structured_output_non_streamed_agent_hooks():
 @pytest.mark.asyncio
 async def test_structured_output_streamed_agent_hooks():
     hooks = AgentHooksForTests()
-    model = FakeModel()
+    model = ScriptedModel()
     agent_1 = Agent(name="test_1", model=model)
     agent_2 = Agent(name="test_2", model=model)
     agent_3 = Agent(
@@ -311,14 +361,14 @@ async def test_structured_output_streamed_agent_hooks():
 
     agent_1.handoffs.append(agent_3)
 
-    model.set_next_output([get_final_output_message(json.dumps({"a": "b"}))])
+    model.enqueue([get_final_output_message(json.dumps({"a": "b"}))])
     output = Runner.run_streamed(agent_3, input="user_message")
     async for _ in output.stream_events():
         pass
     assert hooks.events == {"on_start": 1, "on_end": 1}, f"{output}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
             [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
@@ -338,14 +388,14 @@ async def test_structured_output_streamed_agent_hooks():
     }, f"got unexpected event count: {hooks.events}"
     hooks.reset()
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
-            [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
+            [get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_1")],
             # Second turn: a message, another tool call, and a handoff
             [
                 get_text_message("a_message"),
-                get_function_tool_call("some_function", json.dumps({"a": "b"})),
+                get_function_tool_call("some_function", json.dumps({"a": "b"}), call_id="tool_2"),
                 get_handoff_tool_call(agent_1),
             ],
             # Third turn: a message and a handoff back to the orig agent
@@ -375,7 +425,7 @@ class EmptyAgentHooks(AgentHooks):
 @pytest.mark.asyncio
 async def test_base_agent_hooks_dont_crash():
     hooks = EmptyAgentHooks()
-    model = FakeModel()
+    model = ScriptedModel()
     agent_1 = Agent(name="test_1", model=model)
     agent_2 = Agent(name="test_2", model=model)
     agent_3 = Agent(
@@ -388,12 +438,12 @@ async def test_base_agent_hooks_dont_crash():
     )
     agent_1.handoffs.append(agent_3)
 
-    model.set_next_output([get_final_output_message(json.dumps({"a": "b"}))])
+    model.enqueue([get_final_output_message(json.dumps({"a": "b"}))])
     output = Runner.run_streamed(agent_3, input="user_message")
     async for _ in output.stream_events():
         pass
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
             [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
@@ -405,7 +455,7 @@ async def test_base_agent_hooks_dont_crash():
     )
     await Runner.run(agent_3, input="user_message")
 
-    model.add_multiple_turn_outputs(
+    model.extend(
         [
             # First turn: a tool call
             [get_function_tool_call("some_function", json.dumps({"a": "b"}))],
@@ -440,10 +490,10 @@ class AgentHooksWithTurnInput(AgentHooks):
 async def test_agent_hooks_receives_turn_input_string():
     """Test that on_start receives turn_input when input is a string."""
     hooks = AgentHooksWithTurnInput()
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(name="test", model=model, hooks=hooks)
 
-    model.set_next_output([get_text_message("response")])
+    model.enqueue([get_text_message("response")])
     await Runner.run(agent, input="hello world")
 
     assert len(hooks.captured_turn_inputs) == 1
@@ -457,7 +507,7 @@ async def test_agent_hooks_receives_turn_input_string():
 async def test_agent_hooks_receives_turn_input_list():
     """Test that on_start receives turn_input when input is a list."""
     hooks = AgentHooksWithTurnInput()
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(name="test", model=model, hooks=hooks)
 
     input_items: list[Any] = [
@@ -465,7 +515,7 @@ async def test_agent_hooks_receives_turn_input_list():
         {"role": "user", "content": "second message"},
     ]
 
-    model.set_next_output([get_text_message("response")])
+    model.enqueue([get_text_message("response")])
     await Runner.run(agent, input=input_items)
 
     assert len(hooks.captured_turn_inputs) == 1
@@ -479,10 +529,10 @@ async def test_agent_hooks_receives_turn_input_list():
 async def test_agent_hooks_receives_turn_input_streamed():
     """Test that on_start receives turn_input in streamed mode."""
     hooks = AgentHooksWithTurnInput()
-    model = FakeModel()
+    model = ScriptedModel()
     agent = Agent(name="test", model=model, hooks=hooks)
 
-    model.set_next_output([get_text_message("response")])
+    model.enqueue([get_text_message("response")])
     result = Runner.run_streamed(agent, input="streamed input")
     async for _ in result.stream_events():
         pass

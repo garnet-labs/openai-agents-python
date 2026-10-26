@@ -4,10 +4,18 @@
 
 ## Installation
 
-SQLAlchemy sessions require the `sqlalchemy` extra:
+SQLAlchemy sessions require the `sqlalchemy` optional-dependency extra and an async database driver that matches your database URL.
+
+For the SQLite examples below (`sqlite+aiosqlite://`), install `aiosqlite` alongside the extra:
 
 ```bash
-pip install openai-agents[sqlalchemy]
+pip install 'openai-agents[sqlalchemy]' aiosqlite
+```
+
+The extra already includes `asyncpg` for PostgreSQL URLs that start with `postgresql+asyncpg://`. For MySQL URLs that start with `mysql+aiomysql://`, install `aiomysql` alongside the extra. The driver's `rsa` extra supplies dependencies for MySQL's SHA-256 authentication methods:
+
+```bash
+pip install 'openai-agents[sqlalchemy]' 'aiomysql[rsa]'
 ```
 
 ## Quick start
@@ -21,18 +29,18 @@ import asyncio
 from agents import Agent, Runner
 from agents.extensions.memory import SQLAlchemySession
 
+
 async def main():
     agent = Agent("Assistant")
-    
+
     # Create session using database URL
     session = SQLAlchemySession.from_url(
-        "user-123",
-        url="sqlite+aiosqlite:///:memory:",
-        create_tables=True
+        "user-123", url="sqlite+aiosqlite:///:memory:", create_tables=True
     )
-    
+
     result = await Runner.run(agent, "Hello", session=session)
     print(result.final_output)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -48,26 +56,41 @@ from agents import Agent, Runner
 from agents.extensions.memory import SQLAlchemySession
 from sqlalchemy.ext.asyncio import create_async_engine
 
+
 async def main():
     # Create your database engine
     engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/db")
-    
+
     agent = Agent("Assistant")
-    session = SQLAlchemySession(
-        "user-456",
-        engine=engine,
-        create_tables=True
-    )
-    
+    session = SQLAlchemySession("user-456", engine=engine, create_tables=True)
+
     result = await Runner.run(agent, "Hello", session=session)
     print(result.final_output)
-    
+
     # Clean up
     await engine.dispose()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+## Storing non-ASCII text
+
+By default, `SQLAlchemySession` escapes non-ASCII characters when it serializes session items to JSON. This preserves the historical storage format while still round-tripping the original text when items are loaded.
+
+Set `ensure_ascii=False` when you want multilingual text to remain readable in the stored JSON:
+
+```python
+session = SQLAlchemySession.from_url(
+    "user-123",
+    url="sqlite+aiosqlite:///conversations.db",
+    create_tables=True,
+    ensure_ascii=False,
+)
+```
+
+You can pass the same option directly to `SQLAlchemySession(...)` when using an existing engine. This setting changes only the JSON representation stored in the database; it does not change the values returned by session methods.
 
 
 ## API reference

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import sys
+from collections.abc import Mapping, MutableMapping
+
 import pytest
 
 from agents.models import _openai_shared
@@ -10,6 +14,75 @@ from agents.tracing.provider import DefaultTraceProvider
 from agents.tracing.setup import set_trace_provider
 
 from .testing_processor import SPAN_PROCESSOR_TESTING
+
+_PROXY_ENVIRONMENT_VARIABLES = (
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+)
+_PROXY_OPT_IN_ENVIRONMENT_VARIABLE = "OPENAI_AGENTS_TEST_USE_PROXY"
+_CODEX_SANDBOX_ENVIRONMENT_VARIABLE = "OPENAI_AGENTS_TEST_IN_CODEX_SANDBOX"
+_NATIVE_MACOS_SANDBOX_MARKER = "requires_native_macos_sandbox"
+
+
+def _remove_ambient_proxy_environment(environment: MutableMapping[str, str]) -> None:
+    """Keep unit tests independent from host proxy configuration."""
+    if environment.get(_PROXY_OPT_IN_ENVIRONMENT_VARIABLE, "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return
+
+    for variable in _PROXY_ENVIRONMENT_VARIABLES:
+        environment.pop(variable, None)
+
+
+_remove_ambient_proxy_environment(os.environ)
+
+
+def _running_in_nested_codex_macos_sandbox(
+    *, platform: str, environment: Mapping[str, str]
+) -> bool:
+    return platform == "darwin" and environment.get(_CODEX_SANDBOX_ENVIRONMENT_VARIABLE) == "1"
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    if not _running_in_nested_codex_macos_sandbox(platform=sys.platform, environment=os.environ):
+        return
+
+    skip_native_macos_sandbox = pytest.mark.skip(
+        reason="requires a native macOS sandbox and cannot run inside the Codex outer sandbox"
+    )
+    for item in items:
+        if item.get_closest_marker(_NATIVE_MACOS_SANDBOX_MARKER) is not None:
+            item.add_marker(skip_native_macos_sandbox)
+
+
+collect_ignore: list[str] = []
+
+if sys.platform == "win32":
+    collect_ignore.extend(
+        [
+            "test_example_workflows.py",
+            "test_run_state.py",
+            "sandbox/capabilities/test_filesystem_capability.py",
+            "sandbox/integration_tests/test_runner_pause_resume.py",
+            "sandbox/test_client_options.py",
+            "sandbox/test_exposed_ports.py",
+            "sandbox/test_extract.py",
+            "sandbox/test_memory.py",
+            "sandbox/test_runtime.py",
+            "sandbox/test_session_manager.py",
+            "sandbox/test_session_sinks.py",
+            "sandbox/test_snapshot.py",
+            "sandbox/test_unix_local.py",
+            "sandbox/test_workspace_jsonl_sink.py",
+        ]
+    )
 
 
 # This fixture will run once before any tests are executed
@@ -27,8 +100,6 @@ def setup_span_processor():
 # monkeypatch.delenv("OPENAI_API_KEY", ...) to remove it locally.
 @pytest.fixture(scope="session", autouse=True)
 def ensure_openai_api_key():
-    import os
-
     if not os.environ.get("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = "test_key"
 

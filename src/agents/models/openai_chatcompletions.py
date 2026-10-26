@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import time
 from collections.abc import AsyncIterator
@@ -20,19 +22,24 @@ from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 from .. import _debug
 from ..agent_output import AgentOutputSchemaBase
-from ..exceptions import UserError
+from ..exceptions import ModelBehaviorError, UserError
 from ..handoffs import Handoff
 from ..items import ModelResponse, TResponseInputItem, TResponseStreamEvent
-from ..logger import logger
+from ..logger import log_model_action_debug, logger
 from ..retry import ModelRetryAdvice, ModelRetryAdviceRequest
 from ..tool import Tool
 from ..tracing import generation_span
 from ..tracing.span_data import GenerationSpanData
 from ..tracing.spans import Span
-from ..usage import Usage
+from ..usage import (
+    Usage,
+    _raw_usage_snapshot,
+)
+from ..util._error_tracing import model_span_errors
 from ..util._json import _to_dump_compatible
 from ._openai_retry import get_openai_retry_advice
 from ._retry_runtime import should_disable_provider_managed_retries
+from ._trace import model_config_for_trace, populate_generation_span
 from .chatcmpl_converter import Converter
 from .chatcmpl_helpers import HEADERS, HEADERS_OVERRIDE, ChatCmplHelpers
 from .chatcmpl_stream_handler import ChatCmplStreamHandler
@@ -55,16 +62,122 @@ class OpenAIChatCompletionsModel(Model):
         model: str | ChatModel,
         openai_client: AsyncOpenAI,
         should_replay_reasoning_content: ShouldReplayReasoningContent | None = None,
+        strict_feature_validation: bool = False,
+        buffer_streamed_tool_calls: bool = False,
     ) -> None:
         self.model = model
         self._client = openai_client
         self.should_replay_reasoning_content = should_replay_reasoning_content
+        self._strict_feature_validation = strict_feature_validation
+        self._buffer_streamed_tool_calls = buffer_streamed_tool_calls
+        self._has_warned_unsupported_prompt = False
+        self._has_warned_unsupported_conversation_state = False
+        self._has_warned_unsupported_reasoning_settings = False
 
     def _non_null_or_omit(self, value: Any) -> Any:
         return value if value is not None else omit
 
+    def _supports_default_prompt_cache_key(self) -> bool:
+        return ChatCmplHelpers.is_openai(self._get_client())
+
+    def _handle_unsupported_prompt(self, prompt: ResponsePromptParam | None) -> None:
+        if prompt is None:
+            return
+
+        message = (
+            "Reusable prompts are only supported by the Responses API. "
+            "OpenAIChatCompletionsModel does not support `prompt`; use a Responses model "
+            "instead."
+        )
+        if self._strict_feature_validation:
+            raise UserError(message)
+
+        if not self._has_warned_unsupported_prompt:
+            logger.warning(
+                "%s Ignoring `prompt`; enable strict feature validation to raise an error instead.",
+                message,
+            )
+            self._has_warned_unsupported_prompt = True
+
+    def _handle_unsupported_reasoning_settings(self, model_settings: ModelSettings) -> None:
+        reasoning = model_settings.reasoning
+        if reasoning is None:
+            return
+
+        unsupported = [
+            name for name in ("mode", "context") if getattr(reasoning, name, None) is not None
+        ]
+        if not unsupported:
+            return
+
+        unsupported_params = ", ".join(f"reasoning.{name}" for name in unsupported)
+        message = (
+            f"OpenAIChatCompletionsModel does not support {unsupported_params}. "
+            "These reasoning settings require the Responses API; Chat Completions only "
+            "uses reasoning.effort."
+        )
+        if self._strict_feature_validation:
+            raise UserError(message)
+
+        if not self._has_warned_unsupported_reasoning_settings:
+            logger.warning(
+                "%s Ignoring unsupported reasoning settings; enable strict feature validation "
+                "to raise an error instead.",
+                message,
+            )
+            self._has_warned_unsupported_reasoning_settings = True
+
     def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
         return get_openai_retry_advice(request)
+
+    async def _maybe_aclose_async_iterator(self, iterator: Any) -> None:
+        aclose = getattr(iterator, "aclose", None)
+        if callable(aclose):
+            await aclose()
+            return
+
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close_result = close()
+            if inspect.isawaitable(close_result):
+                await close_result
+
+    def _schedule_async_iterator_close(self, iterator: Any) -> None:
+        self._detach_stream_close(
+            asyncio.ensure_future(self._maybe_aclose_async_iterator(iterator))
+        )
+
+    async def _close_stream_allowing_background_completion(self, iterator: Any) -> None:
+        """Close the provider stream, letting an in-flight close finish in the background.
+
+        Cancellation can arrive while `aclose()` is already awaiting the provider. Shielding the
+        close and detaching that exact task keeps it running instead of abandoning it half-done,
+        and avoids starting a second close: re-closing a provider stream is not guaranteed to be
+        safe or idempotent.
+        """
+        close_task = asyncio.ensure_future(self._maybe_aclose_async_iterator(iterator))
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            self._detach_stream_close(close_task)
+            raise
+
+    def _detach_stream_close(self, close_task: asyncio.Future[None]) -> None:
+        if close_task.done():
+            self._consume_background_cleanup_task_result(close_task)
+            return
+        close_task.add_done_callback(self._consume_background_cleanup_task_result)
+
+    @staticmethod
+    def _consume_background_cleanup_task_result(task: asyncio.Future[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log_model_action_debug(
+                logger, "Background stream cleanup failed after cancellation", exc
+            )
 
     def _validate_official_openai_input_content_types(
         self, request_input: str | list[TResponseInputItem]
@@ -109,15 +222,30 @@ class OpenAIChatCompletionsModel(Model):
         output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
-        previous_response_id: str | None = None,  # unused
-        conversation_id: str | None = None,  # unused
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,
         prompt: ResponsePromptParam | None = None,
     ) -> ModelResponse:
-        with generation_span(
-            model=str(self.model),
-            model_config=model_settings.to_json_dict() | {"base_url": str(self._client.base_url)},
-            disabled=tracing.is_disabled(),
-        ) as span_generation:
+        self._handle_unsupported_server_managed_conversation_state(
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+        )
+        self._handle_unsupported_prompt(prompt)
+
+        with (
+            generation_span(
+                model=str(self.model),
+                model_config=model_config_for_trace(
+                    model_settings, tracing, base_url=self._client.base_url
+                ),
+                disabled=tracing.is_disabled(),
+            ) as span_generation,
+            model_span_errors(
+                span_generation,
+                message="Error getting response",
+                trace_include_sensitive_data=tracing.include_data(),
+            ),
+        ):
             response = await self._fetch_response(
                 system_instructions,
                 input,
@@ -128,8 +256,16 @@ class OpenAIChatCompletionsModel(Model):
                 span_generation,
                 tracing,
                 stream=False,
-                prompt=prompt,
+                prompt=None,
             )
+
+            if not response.choices:
+                provider_error = getattr(response, "error", None)
+                error_details = f": {provider_error}" if provider_error is not None else ""
+                raise ModelBehaviorError(
+                    f"ChatCompletion response has no choices (possible provider error payload)"
+                    f"{error_details}"
+                )
 
             message: ChatCompletionMessage | None = None
             first_choice: Choice | None = None
@@ -146,26 +282,27 @@ class OpenAIChatCompletionsModel(Model):
                         json.dumps(message.model_dump(), indent=2, ensure_ascii=False),
                     )
                 else:
-                    finish_reason = first_choice.finish_reason if first_choice else "-"
-                    logger.debug(f"LLM resp had no message. finish_reason: {finish_reason}")
+                    finish_reason = first_choice.finish_reason if first_choice is not None else "-"
+                    logger.debug("LLM resp had no message. finish_reason: %s", finish_reason)
 
             usage = (
                 Usage(
                     requests=1,
-                    input_tokens=response.usage.prompt_tokens,
-                    output_tokens=response.usage.completion_tokens,
-                    total_tokens=response.usage.total_tokens,
+                    input_tokens=response.usage.prompt_tokens or 0,
+                    output_tokens=response.usage.completion_tokens or 0,
+                    total_tokens=response.usage.total_tokens or 0,
                     # BeforeValidator in Usage normalizes these from Chat Completions types
                     input_tokens_details=response.usage.prompt_tokens_details,  # type: ignore[arg-type]
                     output_tokens_details=response.usage.completion_tokens_details,  # type: ignore[arg-type]
                 )
-                if response.usage
-                else Usage()
+                if response.usage is not None
+                # The request completed, so it counts even when the provider omits usage.
+                else Usage(requests=1)
             )
-            if tracing.include_data():
-                span_generation.span_data.output = (
-                    [message.model_dump()] if message is not None else []
-                )
+
+            # Record the request and token usage on the span before the terminal
+            # branches below, so a ModelBehaviorError raised for a truncated empty
+            # completion still leaves the request and usage accounted for.
             span_generation.span_data.usage = {
                 "requests": usage.requests,
                 "input_tokens": usage.input_tokens,
@@ -175,19 +312,62 @@ class OpenAIChatCompletionsModel(Model):
                 "output_tokens_details": usage.output_tokens_details.model_dump(),
             }
 
+            # Some providers signal a filtered non-streaming completion only through
+            # finish_reason="content_filter" and an otherwise empty message. Preserve
+            # that terminal signal as a refusal instead of returning an empty output.
+            if (
+                message is not None
+                and first_choice is not None
+                and first_choice.finish_reason == "content_filter"
+                and not message.content
+                and not message.refusal
+                and not message.tool_calls
+            ):
+                message.refusal = "Response withheld by the provider's content filter."
+
+            # A completion truncated before any visible token (finish_reason="length")
+            # is a token- or reasoning-budget exhaustion, not a policy refusal.
+            # Surface it as a model behavior error rather than manufacturing a
+            # refusal that would route through model_refusal handlers.
+            if (
+                message is not None
+                and first_choice is not None
+                and first_choice.finish_reason == "length"
+                and not message.content
+                and not message.refusal
+                and not message.tool_calls
+            ):
+                raise ModelBehaviorError(
+                    "Chat Completions response terminated with finish_reason='length' "
+                    "but produced no assistant text, tool call, or refusal."
+                )
+
+            if tracing.include_data():
+                span_generation.span_data.output = (
+                    [message.model_dump()] if message is not None else []
+                )
+
             # Build provider_data for provider_specific_fields
             provider_data = {"model": self.model}
             if message is not None and hasattr(response, "id"):
                 provider_data["response_id"] = response.id
 
             items = (
-                Converter.message_to_output_items(message, provider_data=provider_data)
+                Converter.message_to_output_items(
+                    message,
+                    provider_data=provider_data,
+                    strict_feature_validation=self._strict_feature_validation,
+                )
                 if message is not None
                 else []
             )
 
             logprob_models = None
-            if first_choice and first_choice.logprobs and first_choice.logprobs.content:
+            if (
+                first_choice is not None
+                and first_choice.logprobs is not None
+                and first_choice.logprobs.content
+            ):
                 logprob_models = ChatCmplHelpers.convert_logprobs_for_output_text(
                     first_choice.logprobs.content
                 )
@@ -199,7 +379,38 @@ class OpenAIChatCompletionsModel(Model):
                 output=items,
                 usage=usage,
                 response_id=None,
+                # The OpenAI SDK records the `x-request-id` header on every parsed response,
+                # so callers can inspect the same debugging handle as on the Responses path.
+                request_id=getattr(response, "_request_id", None),
+                raw_usage=(
+                    _raw_usage_snapshot(response.usage)
+                    if model_settings.preserve_raw_usage is True
+                    else None
+                ),
             )
+
+    @staticmethod
+    def _attach_stream_request_id(response: Response, stream: Any) -> None:
+        """Copy the OpenAI request ID onto the synthesized streamed response.
+
+        The streamed Chat Completions response is built locally rather than returned by the
+        API, so the `x-request-id` header has to be carried over from the underlying HTTP
+        response. The terminal response is a `model_copy()` of this object, and that copy
+        preserves the private attribute, so `Runner` can read it back. Custom clients and
+        test doubles may yield a bare async iterator with no HTTP response attached.
+        """
+        headers = getattr(getattr(stream, "response", None), "headers", None)
+        if headers is None:
+            return
+        request_id = headers.get("x-request-id")
+        if request_id is None:
+            return
+        try:
+            response._request_id = request_id
+        except Exception:
+            # Matches the Responses adapter: a custom response object that rejects the
+            # attribute must not break the stream for a debugging field.
+            return
 
     def _attach_logprobs_to_output(
         self, output_items: list[ResponseOutputItem], logprobs: list[Logprob]
@@ -222,18 +433,33 @@ class OpenAIChatCompletionsModel(Model):
         output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
-        previous_response_id: str | None = None,  # unused
-        conversation_id: str | None = None,  # unused
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,
         prompt: ResponsePromptParam | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         """
         Yields a partial message as it is generated, as well as the usage information.
         """
-        with generation_span(
-            model=str(self.model),
-            model_config=model_settings.to_json_dict() | {"base_url": str(self._client.base_url)},
-            disabled=tracing.is_disabled(),
-        ) as span_generation:
+        self._handle_unsupported_server_managed_conversation_state(
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+        )
+        self._handle_unsupported_prompt(prompt)
+
+        with (
+            generation_span(
+                model=str(self.model),
+                model_config=model_config_for_trace(
+                    model_settings, tracing, base_url=self._client.base_url
+                ),
+                disabled=tracing.is_disabled(),
+            ) as span_generation,
+            model_span_errors(
+                span_generation,
+                message="Error streaming response",
+                trace_include_sensitive_data=tracing.include_data(),
+            ),
+        ):
             response, stream = await self._fetch_response(
                 system_instructions,
                 input,
@@ -244,38 +470,107 @@ class OpenAIChatCompletionsModel(Model):
                 span_generation,
                 tracing,
                 stream=True,
-                prompt=prompt,
+                prompt=None,
             )
 
+            self._attach_stream_request_id(response, stream)
+
             final_response: Response | None = None
-            async for chunk in ChatCmplStreamHandler.handle_stream(
-                response, stream, model=self.model
-            ):
-                yield chunk
+            stream_for_handler: AsyncIterator[ChatCompletionChunk]
+            if self._buffer_streamed_tool_calls:
+                stream_for_handler = ChatCmplStreamHandler.buffer_tool_call_stream(stream)
+            else:
+                stream_for_handler = stream
 
-                if chunk.type == "response.completed":
-                    final_response = chunk.response
+            raw_usage_options: dict[str, Any] = (
+                {"preserve_raw_usage": True} if model_settings.preserve_raw_usage is True else {}
+            )
+            close_stream_in_background = False
+            yielded_terminal_event = False
+            try:
+                async for chunk in ChatCmplStreamHandler.handle_stream(
+                    response,
+                    cast(AsyncStream[ChatCompletionChunk], stream_for_handler),
+                    model=self.model,
+                    strict_feature_validation=self._strict_feature_validation,
+                    raise_on_length_truncation=True,
+                    require_finish_reason=ChatCmplHelpers.is_openai(self._client),
+                    **raw_usage_options,
+                ):
+                    if chunk.type == "response.completed":
+                        final_response = chunk.response
+                        yielded_terminal_event = True
+                        # Populate the span before yielding, because a caller that stops
+                        # consuming at the terminal event closes this generator and never
+                        # resumes it, which would leave the span without usage.
+                        self._populate_stream_generation_span(
+                            span_generation, final_response, tracing
+                        )
 
-            if tracing.include_data() and final_response:
-                span_generation.span_data.output = [final_response.model_dump()]
+                    yield chunk
+            except ModelBehaviorError:
+                # The handler preserves the request and any reported token usage on the
+                # base response before raising (e.g. a token-budget-exhausted empty
+                # completion). Attach it to the span before the error surfaces.
+                self._populate_stream_generation_span(span_generation, response, tracing)
+                raise
+            except asyncio.CancelledError:
+                close_stream_in_background = True
+                self._schedule_async_iterator_close(stream)
+                raise
+            finally:
+                if not close_stream_in_background:
+                    try:
+                        await self._close_stream_allowing_background_completion(stream)
+                    except Exception as exc:
+                        if yielded_terminal_event:
+                            log_model_action_debug(
+                                logger,
+                                "Ignoring stream cleanup error after terminal event",
+                                exc,
+                            )
+                        else:
+                            raise
 
-            if final_response and final_response.usage:
-                span_generation.span_data.usage = {
-                    "requests": 1,
-                    "input_tokens": final_response.usage.input_tokens,
-                    "output_tokens": final_response.usage.output_tokens,
-                    "total_tokens": final_response.usage.total_tokens,
-                    "input_tokens_details": (
-                        final_response.usage.input_tokens_details.model_dump()
-                        if final_response.usage.input_tokens_details
-                        else {"cached_tokens": 0}
-                    ),
-                    "output_tokens_details": (
-                        final_response.usage.output_tokens_details.model_dump()
-                        if final_response.usage.output_tokens_details
-                        else {"reasoning_tokens": 0}
-                    ),
-                }
+    @staticmethod
+    def _populate_stream_generation_span(
+        span_generation: Span[GenerationSpanData],
+        final_response: Response,
+        tracing: ModelTracing,
+    ) -> None:
+        populate_generation_span(span_generation, final_response, tracing)
+
+    def _handle_unsupported_server_managed_conversation_state(
+        self,
+        *,
+        previous_response_id: str | None,
+        conversation_id: str | None,
+    ) -> None:
+        unsupported: list[str] = []
+        if previous_response_id is not None:
+            unsupported.append("previous_response_id")
+        if conversation_id is not None:
+            unsupported.append("conversation_id")
+        if not unsupported:
+            return
+
+        unsupported_params = ", ".join(unsupported)
+        message = (
+            "OpenAIChatCompletionsModel does not support server-managed conversation state "
+            f"({unsupported_params}). Chat Completions requires callers to pass the full "
+            "conversation history; use a Responses API model for previous_response_id or a "
+            "conversation-capable model for conversation_id."
+        )
+        if self._strict_feature_validation:
+            raise UserError(message)
+
+        if not self._has_warned_unsupported_conversation_state:
+            logger.warning(
+                "%s Ignoring unsupported server-managed conversation state; enable strict feature "
+                "validation to raise an error instead.",
+                message,
+            )
+            self._has_warned_unsupported_conversation_state = True
 
     @overload
     async def _fetch_response(
@@ -320,12 +615,15 @@ class OpenAIChatCompletionsModel(Model):
         stream: bool = False,
         prompt: ResponsePromptParam | None = None,
     ) -> ChatCompletion | tuple[Response, AsyncStream[ChatCompletionChunk]]:
+        self._handle_unsupported_prompt(prompt)
+        self._handle_unsupported_reasoning_settings(model_settings)
         self._validate_official_openai_input_content_types(input)
         converted_messages = Converter.items_to_messages(
             input,
             model=self.model,
             base_url=str(self._client.base_url),
             should_replay_reasoning_content=self.should_replay_reasoning_content,
+            strict_feature_validation=self._strict_feature_validation,
         )
 
         if system_instructions:
@@ -341,12 +639,6 @@ class OpenAIChatCompletionsModel(Model):
         if tracing.include_data():
             span.span_data.input = converted_messages
 
-        if model_settings.parallel_tool_calls and tools:
-            parallel_tool_calls: bool | Omit = True
-        elif model_settings.parallel_tool_calls is False:
-            parallel_tool_calls = False
-        else:
-            parallel_tool_calls = omit
         tool_choice = Converter.convert_tool_choice(model_settings.tool_choice)
         response_format = Converter.convert_response_format(output_schema)
 
@@ -357,6 +649,11 @@ class OpenAIChatCompletionsModel(Model):
 
         converted_tools = _to_dump_compatible(converted_tools)
         tools_param = converted_tools if converted_tools else omit
+        # Chat Completions rejects parallel_tool_calls unless tools are present, so derive it
+        # from the converted list, which also covers handoff-only turns.
+        parallel_tool_calls: bool | Omit = (
+            self._non_null_or_omit(model_settings.parallel_tool_calls) if converted_tools else omit
+        )
 
         if _debug.DONT_LOG_MODEL_DATA:
             logger.debug("Calling LLM")
@@ -372,14 +669,17 @@ class OpenAIChatCompletionsModel(Model):
                 ensure_ascii=False,
             )
             logger.debug(
-                f"{messages_json}\n"
-                f"Tools:\n{tools_json}\n"
-                f"Stream: {stream}\n"
-                f"Tool choice: {tool_choice}\n"
-                f"Response format: {response_format}\n"
+                "%s\nTools:\n%s\nStream: %s\nTool choice: %s\nResponse format: %s\n",
+                messages_json,
+                tools_json,
+                stream,
+                tool_choice,
+                response_format,
             )
 
-        reasoning_effort = model_settings.reasoning.effort if model_settings.reasoning else None
+        reasoning_effort = (
+            model_settings.reasoning.effort if model_settings.reasoning is not None else None
+        )
         store = ChatCmplHelpers.get_store_param(self._get_client(), model_settings)
 
         stream_options = ChatCmplHelpers.get_stream_options_param(
@@ -388,31 +688,58 @@ class OpenAIChatCompletionsModel(Model):
 
         stream_param: Literal[True] | Omit = True if stream else omit
 
-        ret = await self._get_client().chat.completions.create(
-            model=self.model,
-            messages=converted_messages,
-            tools=tools_param,
-            temperature=self._non_null_or_omit(model_settings.temperature),
-            top_p=self._non_null_or_omit(model_settings.top_p),
-            frequency_penalty=self._non_null_or_omit(model_settings.frequency_penalty),
-            presence_penalty=self._non_null_or_omit(model_settings.presence_penalty),
-            max_tokens=self._non_null_or_omit(model_settings.max_tokens),
-            tool_choice=tool_choice,
-            response_format=response_format,
-            parallel_tool_calls=parallel_tool_calls,
-            stream=cast(Any, stream_param),
-            stream_options=self._non_null_or_omit(stream_options),
-            store=self._non_null_or_omit(store),
-            reasoning_effort=self._non_null_or_omit(reasoning_effort),
-            verbosity=self._non_null_or_omit(model_settings.verbosity),
-            top_logprobs=self._non_null_or_omit(model_settings.top_logprobs),
-            prompt_cache_retention=self._non_null_or_omit(model_settings.prompt_cache_retention),
-            extra_headers=self._merge_headers(model_settings),
-            extra_query=model_settings.extra_query,
-            extra_body=model_settings.extra_body,
-            metadata=self._non_null_or_omit(model_settings.metadata),
-            **(model_settings.extra_args or {}),
+        create_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": converted_messages,
+            "tools": tools_param,
+            "temperature": self._non_null_or_omit(model_settings.temperature),
+            "top_p": self._non_null_or_omit(model_settings.top_p),
+            "frequency_penalty": self._non_null_or_omit(model_settings.frequency_penalty),
+            "presence_penalty": self._non_null_or_omit(model_settings.presence_penalty),
+            "max_tokens": self._non_null_or_omit(model_settings.max_tokens),
+            "tool_choice": tool_choice,
+            "response_format": response_format,
+            "parallel_tool_calls": parallel_tool_calls,
+            "stream": cast(Any, stream_param),
+            "stream_options": self._non_null_or_omit(stream_options),
+            "store": self._non_null_or_omit(store),
+            "reasoning_effort": self._non_null_or_omit(reasoning_effort),
+            "verbosity": self._non_null_or_omit(model_settings.verbosity),
+            "top_logprobs": self._non_null_or_omit(model_settings.top_logprobs),
+            "prompt_cache_retention": self._non_null_or_omit(model_settings.prompt_cache_retention),
+            "prompt_cache_options": self._non_null_or_omit(model_settings.prompt_cache_options),
+            "extra_headers": self._merge_headers(model_settings),
+            "extra_query": model_settings.extra_query,
+            "extra_body": model_settings.extra_body,
+            "metadata": self._non_null_or_omit(model_settings.metadata),
+        }
+        # The Chat Completions API requires logprobs=True whenever top_logprobs is set.
+        # Skip the key when the caller already supplies logprobs via extra_args, so that
+        # extra_args={"logprobs": ...} keeps passing through and setting both top_logprobs
+        # and extra_args["logprobs"] (a pre-existing workaround) does not collide with the
+        # duplicate-key check below.
+        if model_settings.top_logprobs is not None and "logprobs" not in (
+            model_settings.extra_args or {}
+        ):
+            create_kwargs["logprobs"] = True
+        duplicate_extra_arg_keys = sorted(
+            key
+            for key in model_settings.extra_args or {}
+            if key in create_kwargs and not isinstance(create_kwargs[key], Omit)
         )
+        if duplicate_extra_arg_keys:
+            if len(duplicate_extra_arg_keys) == 1:
+                key = duplicate_extra_arg_keys[0]
+                raise TypeError(
+                    f"chat.completions.create() got multiple values for keyword argument '{key}'"
+                )
+            keys = ", ".join(repr(key) for key in duplicate_extra_arg_keys)
+            raise TypeError(
+                f"chat.completions.create() got multiple values for keyword arguments {keys}"
+            )
+        create_kwargs.update(model_settings.extra_args or {})
+
+        ret = await self._get_client().chat.completions.create(**create_kwargs)
 
         if isinstance(ret, ChatCompletion):
             return ret
