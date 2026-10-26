@@ -40,7 +40,7 @@ class Scope:
 
     @classmethod
     def set_current_trace(cls, trace: "Trace | None") -> "contextvars.Token[Trace | None]":
-        logger.debug(f"Setting current trace: {trace.trace_id if trace else None}")
+        logger.debug("Setting current trace")
         return _current_trace.set(trace)
 
     @classmethod

@@ -11,6 +11,7 @@ from agents import (
     Agent,
     FunctionToolResult,
     RunContextWrapper,
+    Runner,
     ToolCallOutputItem,
     ToolsToFinalOutputResult,
     UserError,
@@ -18,6 +19,7 @@ from agents import (
     tool_namespace,
 )
 from agents.run_internal import run_loop
+from agents.testing import ScriptedModel, function_call
 
 from .test_responses import get_function_tool
 
@@ -136,6 +138,91 @@ async def test_custom_tool_use_behavior_async() -> None:
     )
     assert result.is_final_output is True
     assert result.final_output == "async_custom"
+
+
+@pytest.mark.asyncio
+async def test_custom_tool_use_behavior_async_callable_object() -> None:
+    """Async callable objects should be awaited and invoked exactly once."""
+
+    class Behavior:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(
+            self,
+            context: RunContextWrapper,
+            results: list[FunctionToolResult],
+        ) -> ToolsToFinalOutputResult:
+            self.calls += 1
+            assert len(results) == 2
+            return ToolsToFinalOutputResult(
+                is_final_output=True,
+                final_output="async_callable",
+            )
+
+    behavior = Behavior()
+    agent = Agent(name="test", tool_use_behavior=behavior)
+    tool_results = [
+        _make_function_tool_result(agent, "ignored1"),
+        _make_function_tool_result(agent, "ignored2"),
+    ]
+    result = await run_loop.check_for_final_output_from_tools(
+        agent=agent,
+        tool_results=tool_results,
+        context_wrapper=RunContextWrapper(context=None),
+    )
+
+    assert result.is_final_output is True
+    assert result.final_output == "async_callable"
+    assert behavior.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("async_behavior", [False, True])
+@pytest.mark.parametrize("valid_result", [False, True])
+async def test_custom_tool_use_behavior_return_contract(
+    streamed: bool, async_behavior: bool, valid_result: bool
+) -> None:
+    calls = 0
+
+    def behavior(context: RunContextWrapper, results: list[FunctionToolResult]) -> Any:
+        nonlocal calls
+        calls += 1
+        assert len(results) == 1
+        assert results[0].output == "pong"
+        if valid_result:
+            return ToolsToFinalOutputResult(is_final_output=True, final_output="done")
+        return "done"
+
+    async def async_callback(context: RunContextWrapper, results: list[FunctionToolResult]) -> Any:
+        return behavior(context, results)
+
+    model = ScriptedModel([[function_call("ping", {}, call_id="call_1")]])
+    agent = Agent(
+        name="test",
+        tools=[get_function_tool("ping", return_value="pong")],
+        model=model,
+        tool_use_behavior=async_callback if async_behavior else behavior,
+    )
+
+    async def run() -> Any:
+        if streamed:
+            result = Runner.run_streamed(agent, "test")
+            async for _ in result.stream_events():
+                pass
+            return result.final_output
+        return (await Runner.run(agent, "test")).final_output
+
+    if valid_result:
+        assert await run() == "done"
+    else:
+        with pytest.raises(
+            UserError, match="tool_use_behavior callable must return ToolsToFinalOutputResult"
+        ):
+            await run()
+    assert calls == 1
+    assert len(model.calls) == 1
 
 
 @pytest.mark.asyncio

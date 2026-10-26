@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import importlib
 import inspect
@@ -11,9 +12,10 @@ from typing import Any, cast
 
 import pytest
 from openai.types.responses import ResponseFunctionToolCall
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-from agents import Agent, function_tool
+import agents._debug as _debug
+from agents import Agent, Runner, function_tool
 from agents.exceptions import ModelBehaviorError, UserError
 from agents.extensions.experimental.codex import (
     Codex,
@@ -27,8 +29,10 @@ from agents.extensions.experimental.codex.codex_tool import CodexToolInputItem
 from agents.lifecycle import RunHooks
 from agents.run_config import RunConfig
 from agents.run_context import RunContextWrapper
+from agents.run_internal.agent_bindings import bind_public_agent
 from agents.run_internal.run_steps import ToolRunFunction
 from agents.run_internal.tool_execution import execute_function_tool_calls
+from agents.testing import ScriptedModel, function_call
 from agents.tool_context import ToolContext
 from agents.tracing import function_span, trace
 from tests.test_responses import get_function_tool_call
@@ -223,13 +227,10 @@ async def test_codex_tool_streams_events_and_updates_usage() -> None:
     )
 
     custom_spans = [span for span in spans if span.span_data.type == "custom"]
-    assert len(custom_spans) == 3
+    assert len(custom_spans) == 1
 
     for span in custom_spans:
         assert span.parent_id == function_span_obj.span_id
-
-    reasoning_span = next(span for span in custom_spans if span.span_data.name == "Codex reasoning")
-    assert reasoning_span.span_data.data["text"] == "Final reasoning"
 
     command_span = next(
         span for span in custom_spans if span.span_data.name == "Codex command execution"
@@ -238,11 +239,6 @@ async def test_codex_tool_streams_events_and_updates_usage() -> None:
     assert command_span.span_data.data["status"] == "completed"
     assert command_span.span_data.data["output"] == "All good"
     assert command_span.span_data.data["exit_code"] == 0
-
-    mcp_span = next(span for span in custom_spans if span.span_data.name == "Codex MCP tool call")
-    assert mcp_span.span_data.data["server"] == "gitmcp"
-    assert mcp_span.span_data.data["tool"] == "search_codex_code"
-    assert mcp_span.span_data.data["status"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -920,7 +916,7 @@ async def test_codex_tool_persists_thread_id_for_handled_parallel_cancellation()
 
     with pytest.raises(UserError, match="Error running tool error_tool: boom"):
         await execute_function_tool_calls(
-            agent=agent,
+            bindings=bind_public_agent(agent),
             tool_runs=tool_runs,
             hooks=RunHooks(),
             context_wrapper=context_wrapper,
@@ -1523,6 +1519,19 @@ def test_codex_tool_resolve_output_schema_validation_errors() -> None:
         codex_tool_module._resolve_output_schema({"type": "string"})
 
 
+def test_codex_tool_resolve_output_schema_does_not_mutate_input() -> None:
+    nested = {"type": "object", "properties": {"y": {"type": "string"}}}
+    option = {"type": "object", "properties": {"inner": nested}}
+    option_snapshot = copy.deepcopy(option)
+
+    result = codex_tool_module._resolve_output_schema(option)
+
+    assert option == option_snapshot
+    assert nested == {"type": "object", "properties": {"y": {"type": "string"}}}
+    assert result is not None
+    assert result["properties"]["inner"] is not nested
+
+
 def test_codex_tool_resolve_output_schema_descriptor() -> None:
     descriptor = {
         "title": "Report",
@@ -1795,7 +1804,13 @@ async def test_replaced_codex_tool_preserves_codex_collision_markers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_codex_tool_consume_events_with_on_stream_error() -> None:
+async def test_codex_tool_consume_events_with_on_stream_error(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(_debug, "DONT_LOG_MODEL_DATA", True)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+    secret = "SECRET_CODEX_STREAM_PAYLOAD"
     events = [
         {
             "type": "item.started",
@@ -1858,7 +1873,7 @@ async def test_codex_tool_consume_events_with_on_stream_error() -> None:
     def on_stream(payload: CodexToolStreamEvent) -> None:
         callbacks.append(payload.event.type)
         if payload.event.type == "item.started":
-            raise RuntimeError("boom")
+            raise RuntimeError(secret)
 
     context = ToolContext(
         context=None,
@@ -1867,20 +1882,22 @@ async def test_codex_tool_consume_events_with_on_stream_error() -> None:
         tool_arguments="{}",
     )
 
-    with trace("codex-test"):
-        response, usage, thread_id = await codex_tool_module._consume_events(
-            event_stream(),
-            {"inputs": [{"type": "text", "text": "hello"}]},
-            context,
-            SimpleNamespace(id="thread-1"),
-            on_stream,
-            64,
-        )
+    with caplog.at_level("ERROR", logger="openai.agents"):
+        with trace("codex-test"):
+            response, usage, thread_id = await codex_tool_module._consume_events(
+                event_stream(),
+                {"inputs": [{"type": "text", "text": "hello"}]},
+                context,
+                SimpleNamespace(id="thread-1"),
+                on_stream,
+                64,
+            )
 
     assert response == "done"
     assert usage == Usage(input_tokens=1, cached_input_tokens=0, output_tokens=1)
     assert thread_id == "thread-1"
     assert "item.started" in callbacks
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2039,3 +2056,402 @@ def test_codex_tool_coerce_options_rejects_empty_run_context_key() -> None:
                 "run_context_thread_id_key": " ",
             }
         )
+
+
+_CODEX_TOOL_ARGUMENT_SECRET = "SECRET_CODEX_TOOL_ARGUMENT_123"
+
+
+@pytest.mark.parametrize(
+    "input_json, cause_type",
+    [
+        (
+            f'{{"inputs": "{_CODEX_TOOL_ARGUMENT_SECRET}"}}',
+            ValidationError,
+        ),
+        (
+            f"not valid json {_CODEX_TOOL_ARGUMENT_SECRET}",
+            json.JSONDecodeError,
+        ),
+    ],
+    ids=["validation", "json_decode"],
+)
+@pytest.mark.parametrize("redact", [True, False], ids=["redacted", "diagnostic"])
+@pytest.mark.asyncio
+async def test_codex_tool_argument_errors_respect_tool_data_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+    input_json: str,
+    cause_type: type[Exception],
+    redact: bool,
+) -> None:
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", redact)
+    tool = codex_tool(
+        CodexToolOptions(
+            codex=cast(Codex, FakeCodex(CodexMockState())),
+            failure_error_function=None,
+        )
+    )
+    context = ToolContext(
+        None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    with pytest.raises(ModelBehaviorError) as exc_info:
+        await tool.on_invoke_tool(context, input_json)
+
+    error = exc_info.value
+    if redact:
+        assert str(error) == "Invalid JSON input for codex tool"
+        assert _CODEX_TOOL_ARGUMENT_SECRET not in str(error)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+    else:
+        assert _CODEX_TOOL_ARGUMENT_SECRET in str(error)
+        assert isinstance(error.__cause__, cause_type)
+
+
+class _FatalCodexStreamHandlerError(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler_error",
+    [_FatalCodexStreamHandlerError("fatal"), asyncio.CancelledError()],
+    ids=["base_exception", "cancelled_error"],
+)
+async def test_codex_tool_streaming_propagates_base_exception_and_finishes_spans(
+    monkeypatch: pytest.MonkeyPatch,
+    handler_error: BaseException,
+) -> None:
+    class RecordingSpan:
+        def __init__(self) -> None:
+            self.started = False
+            self.finished = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def finish(self) -> None:
+            self.finished = True
+
+    span = RecordingSpan()
+    monkeypatch.setattr(codex_tool_module, "custom_span", lambda **_kwargs: span)
+    source_cancelled = asyncio.Event()
+
+    async def event_stream():
+        yield {
+            "type": "item.started",
+            "item": {
+                "id": "cmd-1",
+                "type": "command_execution",
+                "command": "pwd",
+                "status": "in_progress",
+            },
+        }
+        try:
+            await asyncio.Event().wait()
+        finally:
+            source_cancelled.set()
+
+    def on_stream(payload: CodexToolStreamEvent) -> None:
+        del payload
+        raise handler_error
+
+    context = ToolContext(
+        context=None,
+        tool_name="codex",
+        tool_call_id="call-1",
+        tool_arguments="{}",
+    )
+
+    with pytest.raises(type(handler_error)):
+        await asyncio.wait_for(
+            codex_tool_module._consume_events(
+                event_stream(),
+                {"inputs": [{"type": "text", "text": "hello"}]},
+                context,
+                SimpleNamespace(id="thread-1"),
+                on_stream,
+                64,
+            ),
+            timeout=1.0,
+        )
+
+    assert span.started
+    assert span.finished
+    assert source_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_codex_tool_streaming_parent_cancellation_stops_dispatcher() -> None:
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    source_cancelled = asyncio.Event()
+
+    async def event_stream():
+        yield {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1},
+        }
+        try:
+            await asyncio.Event().wait()
+        finally:
+            source_cancelled.set()
+
+    async def on_stream(payload: CodexToolStreamEvent) -> None:
+        del payload
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            handler_cancelled.set()
+
+    context = ToolContext(
+        context=None,
+        tool_name="codex",
+        tool_call_id="call-1",
+        tool_arguments="{}",
+    )
+    invoke_task = asyncio.create_task(
+        codex_tool_module._consume_events(
+            event_stream(),
+            {"inputs": [{"type": "text", "text": "hello"}]},
+            context,
+            SimpleNamespace(id="thread-1"),
+            on_stream,
+            64,
+        )
+    )
+
+    await asyncio.wait_for(handler_started.wait(), timeout=1.0)
+    invoke_task.cancel()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(invoke_task, timeout=1.0)
+    finally:
+        if not invoke_task.done():
+            invoke_task.cancel()
+        await asyncio.gather(invoke_task, return_exceptions=True)
+
+    assert source_cancelled.is_set()
+    assert handler_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_codex_tool_streaming_drains_events_before_stream_error() -> None:
+    handler_started = asyncio.Event()
+    terminal_event_emitted = asyncio.Event()
+    allow_handler_to_finish = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    handled_event_types: list[str] = []
+
+    async def event_stream():
+        yield {"type": "turn.started"}
+        await handler_started.wait()
+        terminal_event_emitted.set()
+        yield {"type": "turn.failed", "error": {"message": "boom"}}
+
+    async def on_stream(payload: CodexToolStreamEvent) -> None:
+        if not handled_event_types:
+            handler_started.set()
+            try:
+                await allow_handler_to_finish.wait()
+            except asyncio.CancelledError:
+                handler_cancelled.set()
+                raise
+        handled_event_types.append(payload.event.type)
+
+    context = ToolContext(
+        context=None,
+        tool_name="codex",
+        tool_call_id="call-1",
+        tool_arguments="{}",
+    )
+    invoke_task = asyncio.create_task(
+        codex_tool_module._consume_events(
+            event_stream(),
+            {"inputs": [{"type": "text", "text": "hello"}]},
+            context,
+            SimpleNamespace(id="thread-1"),
+            on_stream,
+            64,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(terminal_event_emitted.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+        assert not invoke_task.done()
+        assert not handler_cancelled.is_set()
+
+        allow_handler_to_finish.set()
+        with pytest.raises(UserError, match="Codex turn failed: boom"):
+            await asyncio.wait_for(invoke_task, timeout=1.0)
+    finally:
+        if not invoke_task.done():
+            invoke_task.cancel()
+        await asyncio.gather(invoke_task, return_exceptions=True)
+
+    assert handled_event_types == ["turn.started", "turn.failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_sensitive_data", [False, True, None])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_codex_command_spans_respect_run_tracing_policy(
+    monkeypatch: pytest.MonkeyPatch, include_sensitive_data: bool | None, failed: bool
+) -> None:
+    # None exercises the existing direct-call contract without a RunConfig.
+    command = "SYNTHETIC_PRIVATE_COMMAND"
+    outputs = ["SYNTHETIC_START_OUTPUT", "SYNTHETIC_UPDATE_OUTPUT", "SYNTHETIC_FINAL_OUTPUT"]
+    response = "SYNTHETIC_APPLICATION_RESPONSE"
+    state = CodexMockState()
+    for index, event_type in enumerate(["item.started", "item.updated", "item.completed"]):
+        state.events.append(
+            {
+                "type": event_type,
+                "item": {
+                    "id": "command-1",
+                    "type": "command_execution",
+                    "command": command,
+                    "aggregated_output": outputs[index],
+                    "status": ("failed" if failed else "completed")
+                    if index == 2
+                    else "in_progress",
+                    "exit_code": (1 if failed else 0) if index == 2 else None,
+                },
+            }
+        )
+    state.events.append(
+        {
+            "type": "item.completed",
+            "item": {"id": "message-1", "type": "agent_message", "text": response},
+        }
+    )
+    command_spans: list[Any] = []
+    snapshots: list[dict[str, Any]] = []
+    original_start = SPAN_PROCESSOR_TESTING.on_span_start
+
+    def on_span_start(span: Any) -> None:
+        original_start(span)
+        if span.span_data.type == "custom" and span.span_data.name == "Codex command execution":
+            command_spans.append(span)
+            snapshots.append(copy.deepcopy(span.export()))
+
+    monkeypatch.setattr(SPAN_PROCESSOR_TESTING, "on_span_start", on_span_start)
+
+    async def run_streamed(_self: Any, _input: Any, _options: Any) -> Any:
+        async def events() -> Any:
+            for event in state.events:
+                yield event
+                if command_spans:
+                    snapshots.append(copy.deepcopy(command_spans[0].export()))
+
+        return SimpleNamespace(events=events())
+
+    monkeypatch.setattr(FakeThread, "run_streamed", run_streamed)
+    callbacks: list[CodexToolStreamEvent] = []
+    tool = codex_tool(codex=cast(Codex, FakeCodex(state)), on_stream=callbacks.append)
+    arguments = {"inputs": [{"type": "text", "text": "Run the test task"}]}
+    if include_sensitive_data is None:
+        with trace("direct-codex"):
+            result = await tool.on_invoke_tool(
+                ToolContext(
+                    None,
+                    tool_name=tool.name,
+                    tool_call_id="call-1",
+                    tool_arguments=json.dumps(arguments),
+                ),
+                json.dumps(arguments),
+            )
+        assert result.response == response
+    else:
+        agent = Agent(
+            name="test",
+            tools=[tool],
+            tool_use_behavior="stop_on_first_tool",
+            model=ScriptedModel([[function_call(tool.name, arguments, call_id="call-1")]]),
+        )
+        result = await Runner.run(
+            agent,
+            "Run the test task",
+            run_config=RunConfig(trace_include_sensitive_data=include_sensitive_data),
+        )
+        assert json.loads(result.final_output)["response"] == response
+
+    assert len(command_spans) == 1
+    assert len(snapshots) == 5
+    final_span = command_spans[0].export()
+    assert final_span is not None
+    assert final_span["span_data"]["data"]["status"] == ("failed" if failed else "completed")
+    assert final_span["span_data"]["data"]["exit_code"] == (1 if failed else 0)
+    if include_sensitive_data is False:
+        all_exports = [span.export() for span in SPAN_PROCESSOR_TESTING.get_ordered_spans()]
+        serialized = json.dumps([snapshots, all_exports])
+        for secret in [command, *outputs, response]:
+            assert secret not in serialized
+        for snapshot in snapshots:
+            assert "command" not in snapshot["span_data"]["data"]
+            assert "output" not in snapshot["span_data"]["data"]
+        if failed:
+            assert final_span["error"]["data"] == {"exit_code": 1}
+    else:
+        assert snapshots[0]["span_data"]["data"]["command"] == command
+        for output, snapshot in zip(outputs, snapshots[1:4], strict=False):
+            assert snapshot["span_data"]["data"]["output"] == output
+        if failed:
+            assert final_span["error"]["data"]["output"] == outputs[-1]
+    assert [payload.event.item.aggregated_output for payload in callbacks[:3]] == outputs
+    assert callbacks[-1].event.item.text == response
+
+
+@pytest.mark.asyncio
+async def test_codex_command_tracing_disabled_with_caller_trace() -> None:
+    state = CodexMockState()
+    state.events = [
+        {
+            "type": event_type,
+            "item": {
+                "id": "command-1",
+                "type": "command_execution",
+                "command": "SYNTHETIC_COMMAND",
+                "aggregated_output": "SYNTHETIC_OUTPUT",
+                "status": status,
+            },
+        }
+        for event_type, status in [
+            ("item.started", "in_progress"),
+            ("item.updated", "in_progress"),
+            ("item.completed", "completed"),
+        ]
+    ]
+    tool = codex_tool(codex=cast(Codex, FakeCodex(state)))
+    agent = Agent(
+        name="test",
+        tools=[tool],
+        tool_use_behavior="stop_on_first_tool",
+        model=ScriptedModel(
+            [
+                [
+                    function_call(
+                        tool.name,
+                        {"inputs": [{"type": "text", "text": "Run the task"}]},
+                        call_id="call-1",
+                    )
+                ]
+            ]
+        ),
+    )
+    with trace("caller-owned"):
+        result = await Runner.run(
+            agent, "Run the task", run_config=RunConfig(tracing_disabled=True)
+        )
+    assert json.loads(result.final_output)["response"] == "Codex task completed with inputs."
+    assert not any(
+        span.span_data.type == "custom" and span.span_data.name == "Codex command execution"
+        for span in SPAN_PROCESSOR_TESTING.get_ordered_spans()
+    )

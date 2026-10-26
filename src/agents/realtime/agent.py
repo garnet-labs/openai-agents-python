@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-from collections.abc import Awaitable
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generic, cast
+from typing import Any, Generic
 
 from agents.prompts import Prompt
 
+from .. import _debug
 from ..agent import AgentBase
 from ..guardrail import OutputGuardrail
 from ..handoffs import Handoff
@@ -79,11 +80,46 @@ class RealtimeAgent(AgentBase, Generic[TContext]):
     """A class that receives callbacks on various lifecycle events for this agent.
     """
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TypeError(f"RealtimeAgent name must be a string, got {type(self.name).__name__}")
+        if not isinstance(self.tools, list):
+            raise TypeError(f"RealtimeAgent tools must be a list, got {type(self.tools).__name__}")
+        if not isinstance(self.handoffs, list):
+            raise TypeError(
+                f"RealtimeAgent handoffs must be a list, got {type(self.handoffs).__name__}"
+            )
+        if (
+            self.instructions is not None
+            and not isinstance(self.instructions, str)
+            and not callable(self.instructions)
+        ):
+            raise TypeError(
+                f"RealtimeAgent instructions must be a string, callable, or None, "
+                f"got {type(self.instructions).__name__}"
+            )
+
     def clone(self, **kwargs: Any) -> RealtimeAgent[TContext]:
-        """Make a copy of the agent, with the given arguments changed. For example, you could do:
-        ```
-        new_agent = agent.clone(instructions="New instructions")
-        ```
+        """Make a copy of the agent, with the given arguments changed.
+
+        Notes:
+            - Uses `dataclasses.replace`, which performs a **shallow copy** and never copies a
+              list attribute such as `tools`, `handoffs`, `mcp_servers`, or `output_guardrails`.
+              Each of those attributes is whatever the merged arguments hold.
+            - An attribute you do not pass arrives as the original agent's own list, so both
+              agents hold that one list and its entries. Appending through either agent, for
+              example `cloned.tools.append(extra_tool)`, therefore also changes the other.
+            - An attribute you do pass is used exactly as given, so it shares a list or an entry
+              with the original agent only where you reused one. `agent.clone(tools=agent.tools)`
+              still shares that list, while `agent.clone(tools=[other_tool])` shares nothing.
+            - To give the clone a list that no other agent holds, pass a new one, for example
+              `agent.clone(tools=[*agent.tools, extra_tool])`. The entries copied into it remain
+              the same objects the original agent holds.
+
+        Example:
+            ```python
+            new_agent = agent.clone(instructions="New instructions")
+            ```
         """
         return dataclasses.replace(self, **kwargs)
 
@@ -92,11 +128,19 @@ class RealtimeAgent(AgentBase, Generic[TContext]):
         if isinstance(self.instructions, str):
             return self.instructions
         elif callable(self.instructions):
-            if inspect.iscoroutinefunction(self.instructions):
-                return await cast(Awaitable[str], self.instructions(run_context, self))
-            else:
-                return cast(str, self.instructions(run_context, self))
+            # Call once, then await if needed. Callable instances with async
+            # ``__call__`` are not coroutine functions, so checking
+            # ``iscoroutinefunction(self.instructions)`` would skip the await.
+            result = self.instructions(run_context, self)
+            if inspect.isawaitable(result):
+                return await result
+            return result
         elif self.instructions is not None:
-            logger.error(f"Instructions must be a string or a function, got {self.instructions}")
+            if _debug.DONT_LOG_MODEL_DATA:
+                logger.error("Instructions must be a string or a function")
+            else:
+                logger.error(
+                    "Instructions must be a string or a function, got %s", self.instructions
+                )
 
         return None

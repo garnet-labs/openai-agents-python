@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Any, Callable, cast, overload
+from collections.abc import Callable, Iterable
+from functools import partial
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from pydantic import TypeAdapter
 from typing_extensions import TypeVar
 
-from ..exceptions import ModelBehaviorError, UserError
-from ..handoffs import Handoff
+from ..exceptions import (
+    ModelBehaviorError,
+    UserError,
+)
+from ..handoffs import Handoff, _invoke_handoff_with_redaction
 from ..run_context import RunContextWrapper, TContext
 from ..strict_schema import ensure_strict_json_schema
 from ..tracing.spans import SpanError
 from ..util import _error_tracing, _json
+from ..util._asyncio_tasks import gather_with_cancel
 from ..util._types import MaybeAwaitable
 from . import RealtimeAgent
 
@@ -24,6 +30,43 @@ THandoffInput = TypeVar("THandoffInput", default=Any)
 
 OnHandoffWithInput = Callable[[RunContextWrapper[Any], THandoffInput], Any]
 OnHandoffWithoutInput = Callable[[RunContextWrapper[Any]], Any]
+
+
+async def filter_enabled_handoffs(
+    handoffs: Iterable[Handoff[Any, Any]],
+    context_wrapper: RunContextWrapper[Any],
+    agent: RealtimeAgent[Any],
+) -> list[Handoff[Any, Any]]:
+    handoffs_list = list(handoffs)
+
+    async def _check_handoff_enabled(handoff_obj: Handoff[Any, Any]) -> bool:
+        attr = handoff_obj.is_enabled
+        if isinstance(attr, bool):
+            return attr
+        result = attr(context_wrapper, agent)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    results = await gather_with_cancel(*(_check_handoff_enabled(h) for h in handoffs_list))
+    return [h for h, ok in zip(handoffs_list, results, strict=False) if ok]
+
+
+async def collect_enabled_handoffs(
+    agent: RealtimeAgent[Any],
+    context_wrapper: RunContextWrapper[Any],
+) -> list[Handoff[Any, RealtimeAgent[Any]]]:
+    handoffs: list[Handoff[Any, RealtimeAgent[Any]]] = []
+    for handoff_item in agent.handoffs:
+        if isinstance(handoff_item, Handoff):
+            handoffs.append(handoff_item)
+        elif isinstance(handoff_item, RealtimeAgent):
+            handoffs.append(realtime_handoff(handoff_item))
+
+    return cast(
+        list[Handoff[Any, RealtimeAgent[Any]]],
+        await filter_enabled_handoffs(handoffs, context_wrapper, agent),
+    )
 
 
 @overload
@@ -87,12 +130,12 @@ def realtime_handoff(
 
     Note: input_filter is not supported for RealtimeAgent handoffs.
     """
-    assert (on_handoff and input_type) or not (on_handoff and input_type), (
-        "You must provide either both on_handoff and input_type, or neither"
-    )
+    if input_type is not None and on_handoff is None:
+        raise UserError("You must provide on_handoff when input_type is provided")
     type_adapter: TypeAdapter[Any] | None
     if input_type is not None:
-        assert callable(on_handoff), "on_handoff must be callable"
+        if not callable(on_handoff):
+            raise UserError("on_handoff must be callable")
         sig = inspect.signature(on_handoff)
         if len(sig.parameters) != 2:
             raise UserError("on_handoff must take two arguments: context and input")
@@ -107,7 +150,7 @@ def realtime_handoff(
             if len(sig.parameters) != 1:
                 raise UserError("on_handoff must take one argument: context")
 
-    async def _invoke_handoff(
+    async def _invoke_handoff_impl(
         ctx: RunContextWrapper[Any], input_json: str | None = None
     ) -> RealtimeAgent[TContext]:
         if input_type is not None and type_adapter is not None:
@@ -124,18 +167,18 @@ def realtime_handoff(
                 json_str=input_json,
                 type_adapter=type_adapter,
                 partial=False,
+                strict=True,
+                contains_tool_data=True,
             )
             input_func = cast(OnHandoffWithInput[THandoffInput], on_handoff)
-            if inspect.iscoroutinefunction(input_func):
-                await input_func(ctx, validated_input)
-            else:
-                input_func(ctx, validated_input)
+            result = input_func(ctx, validated_input)
+            if inspect.isawaitable(result):
+                await result
         elif on_handoff is not None:
             no_input_func = cast(OnHandoffWithoutInput, on_handoff)
-            if inspect.iscoroutinefunction(no_input_func):
-                await no_input_func(ctx)
-            else:
-                no_input_func(ctx)
+            result = no_input_func(ctx)
+            if inspect.isawaitable(result):
+                await result
 
         return agent
 
@@ -158,7 +201,7 @@ def realtime_handoff(
         tool_name=tool_name,
         tool_description=tool_description,
         input_json_schema=input_json_schema,
-        on_invoke_handoff=_invoke_handoff,
+        on_invoke_handoff=partial(_invoke_handoff_with_redaction, _invoke_handoff_impl),
         input_filter=None,  # Not supported for RealtimeAgent handoffs
         agent_name=agent.name,
         is_enabled=_is_enabled if callable(is_enabled) else is_enabled,

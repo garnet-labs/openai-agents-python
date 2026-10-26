@@ -3,17 +3,25 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any, cast
+from uuid import uuid4
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, omit
 
 from ... import _debug
-from ...exceptions import AgentsException
+from ...exceptions import AgentsException, UserError
 from ...logger import logger
+from ...models._openai_websocket import (
+    get_openai_websocket_logger,
+    merge_openai_client_websocket_headers,
+    prepare_openai_client_websocket_base_url,
+    refresh_openai_client_api_key_if_supported,
+)
 from ...tracing import Span, SpanError, TranscriptionSpanData, transcription_span
+from ...util._error_tracing import get_trace_error
 from ..exceptions import STTWebsocketConnectionError
 from ..imports import np, npt, websockets
 from ..input import AudioInput, StreamedAudioInput
@@ -39,28 +47,68 @@ class WebsocketDoneSentinel:
     pass
 
 
+class _InputCompleteSentinel:
+    pass
+
+
+class _ListenerError(Exception):
+    pass
+
+
 def _audio_to_base64(audio_data: list[npt.NDArray[np.int16 | np.float32]]) -> str:
-    concatenated_audio = np.concatenate(audio_data)
-    if concatenated_audio.dtype == np.float32:
-        # convert to int16
-        concatenated_audio = np.clip(concatenated_audio, -1.0, 1.0)
-        concatenated_audio = (concatenated_audio * 32767).astype(np.int16)
-    audio_bytes = concatenated_audio.tobytes()
-    return base64.b64encode(audio_bytes).decode("utf-8")
+    return _audio_buffer_to_base64(np.concatenate(audio_data))
+
+
+def _audio_buffer_to_base64(buffer: npt.NDArray[np.int16 | np.float32]) -> str:
+    if buffer.dtype == np.float32:
+        # Convert to int16.
+        buffer = np.clip(buffer, -1.0, 1.0)
+        buffer = (buffer * 32767).astype(np.int16)
+    elif buffer.dtype != np.int16:
+        raise UserError("Buffer must be a numpy array of int16 or float32")
+    return base64.b64encode(buffer.tobytes()).decode("utf-8")
+
+
+def _prepare_websocket_url(client: AsyncOpenAI) -> str:
+    base_url = prepare_openai_client_websocket_base_url(
+        client,
+        context="Streamed STT websocket",
+    )
+    params: dict[str, Any] = dict(base_url.params)
+    params["intent"] = "transcription"
+    path = base_url.path.rstrip("/") + "/realtime"
+    return str(base_url.copy_with(path=path, params=params))
+
+
+def _prepare_websocket_headers(client: AsyncOpenAI) -> dict[str, str]:
+    return merge_openai_client_websocket_headers(client)
 
 
 async def _wait_for_event(
-    event_queue: asyncio.Queue[dict[str, Any]], expected_types: list[str], timeout: float
+    event_queue: asyncio.Queue[dict[str, Any] | ErrorSentinel],
+    expected_types: list[str],
+    timeout: float,
 ):
     """
     Wait for an event from event_queue whose type is in expected_types within the specified timeout.
     """
-    start_time = time.time()
+    # Wall-clock adjustments can move a deadline forwards or backwards. Timeout
+    # accounting must use a monotonic clock instead.
+    start_time = monotonic()
     while True:
-        remaining = timeout - (time.time() - start_time)
+        remaining = timeout - (monotonic() - start_time)
         if remaining <= 0:
             raise TimeoutError(f"Timeout waiting for event(s): {expected_types}")
-        evt = await asyncio.wait_for(event_queue.get(), timeout=remaining)
+        try:
+            evt = await asyncio.wait_for(event_queue.get(), timeout=remaining)
+        except asyncio.TimeoutError as e:
+            # On Python 3.10 asyncio.wait_for raises asyncio.TimeoutError, which is not
+            # the builtin TimeoutError the callers catch to wrap the failure as
+            # STTWebsocketConnectionError. The two became one class in 3.11. Raise the
+            # builtin so every timeout leaves this function as the same type.
+            raise TimeoutError(f"Timeout waiting for event(s): {expected_types}") from e
+        if isinstance(evt, ErrorSentinel):
+            raise _ListenerError("Websocket listener failed") from evt.error
         evt_type = evt.get("type", "")
         if evt_type in expected_types:
             return evt
@@ -93,10 +141,13 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
             asyncio.Queue()
         )
         self._websocket: websockets.ClientConnection | None = None
-        self._event_queue: asyncio.Queue[dict[str, Any] | WebsocketDoneSentinel] = asyncio.Queue()
-        self._state_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._event_queue: asyncio.Queue[
+            dict[str, Any] | ErrorSentinel | WebsocketDoneSentinel | _InputCompleteSentinel
+        ] = asyncio.Queue()
+        self._state_queue: asyncio.Queue[dict[str, Any] | ErrorSentinel] = asyncio.Queue()
         self._turn_audio_buffer: list[npt.NDArray[np.int16 | np.float32]] = []
         self._tracing_span: Span[TranscriptionSpanData] | None = None
+        self._transcription_config: dict[str, Any] | None = None
 
         # tasks
         self._listener_task: asyncio.Task[Any] | None = None
@@ -104,24 +155,52 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
         self._stream_audio_task: asyncio.Task[Any] | None = None
         self._connection_task: asyncio.Task[Any] | None = None
         self._stored_exception: Exception | None = None
+        self._completion_signaled = False
+        self._final_commit_id: str | None = None
+        self._closing = False
+
+    def _get_transcription_config(self) -> dict[str, Any]:
+        transcription_config: dict[str, Any] = {"model": self._model}
+        if self._settings.languages is not None:
+            transcription_config["languages"] = list(self._settings.languages)
+        elif self._settings.language is not None:
+            if self._model in {"gpt-transcribe", "gpt-live-transcribe"}:
+                transcription_config["languages"] = [self._settings.language]
+            else:
+                transcription_config["language"] = self._settings.language
+        if self._settings.prompt is not None:
+            transcription_config["prompt"] = self._settings.prompt
+        if self._settings.keywords is not None:
+            transcription_config["keywords"] = list(self._settings.keywords)
+        return transcription_config
 
     def _start_turn(self) -> None:
+        # A listener failure can surface a buffered transcript before session.update completes.
+        # Once configured, every normal turn reuses the exact detached request snapshot.
+        transcription_config = self._transcription_config or self._get_transcription_config()
         self._tracing_span = transcription_span(
             model=self._model,
             model_config={
                 "temperature": self._settings.temperature,
-                "language": self._settings.language,
-                "prompt": self._settings.prompt,
+                "language": transcription_config.get("language"),
+                "languages": transcription_config.get("languages"),
+                "keywords": (
+                    transcription_config.get("keywords")
+                    if self._trace_include_sensitive_data
+                    else None
+                ),
+                "prompt": (
+                    transcription_config.get("prompt")
+                    if self._trace_include_sensitive_data
+                    else None
+                ),
                 "turn_detection": self._turn_detection,
             },
         )
         self._tracing_span.start()
 
     def _end_turn(self, _transcript: str) -> None:
-        if len(_transcript) < 1:
-            return
-
-        if self._tracing_span:
+        if self._tracing_span is not None:
             # Only encode audio if tracing is enabled AND buffer is not empty
             if self._trace_include_sensitive_audio_data and self._turn_audio_buffer:
                 self._tracing_span.span_data.input = _audio_to_base64(self._turn_audio_buffer)
@@ -138,11 +217,20 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
     async def _event_listener(self) -> None:
         assert self._websocket is not None, "Websocket not initialized"
 
-        async for message in self._websocket:
-            try:
+        try:
+            async for message in self._websocket:
                 event = json.loads(message)
 
                 if event.get("type") == "error":
+                    error = event.get("error", {})
+                    if (
+                        self._final_commit_id is not None
+                        and error.get("event_id") == self._final_commit_id
+                        and error.get("code") == "input_audio_buffer_commit_empty"
+                    ):
+                        # VAD may already have committed the final buffer. Only this
+                        # specific response to our EOF commit is an expected no-op.
+                        continue
                     raise STTWebsocketConnectionError(f"Error event: {event.get('error')}")
 
                 if event.get("type") in [
@@ -154,30 +242,34 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
                     await self._state_queue.put(event)
 
                 await self._event_queue.put(event)
-            except Exception as e:
-                await self._output_queue.put(ErrorSentinel(e))
-                raise STTWebsocketConnectionError("Error parsing events") from e
-        await self._event_queue.put(WebsocketDoneSentinel())
+        except Exception as e:
+            error = ErrorSentinel(e)
+            await self._event_queue.put(error)
+            await self._state_queue.put(error)
+        finally:
+            await self._event_queue.put(WebsocketDoneSentinel())
 
     async def _configure_session(self) -> None:
         assert self._websocket is not None, "Websocket not initialized"
-        await self._websocket.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "type": "transcription",
-                        "audio": {
-                            "input": {
-                                "format": {"type": "audio/pcm", "rate": 24000},
-                                "transcription": {"model": self._model},
-                                "turn_detection": self._turn_detection,
-                            }
-                        },
+        transcription_config = self._get_transcription_config()
+        session_update = json.dumps(
+            {
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                            "transcription": transcription_config,
+                            "turn_detection": self._turn_detection,
+                        }
                     },
-                }
-            )
+                },
+            }
         )
+        self._transcription_config = transcription_config
+
+        await self._websocket.send(session_update)
 
     async def _setup_connection(self, ws: websockets.ClientConnection) -> None:
         self._websocket = ws
@@ -189,6 +281,8 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
                 ["session.created", "transcription_session.created"],
                 SESSION_CREATION_TIMEOUT,
             )
+        except _ListenerError:
+            raise
         except TimeoutError as e:
             wrapped_err = STTWebsocketConnectionError(
                 "Timeout waiting for transcription_session.created event"
@@ -197,7 +291,7 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
             raise wrapped_err from e
         except Exception as e:
             await self._output_queue.put(ErrorSentinel(e))
-            raise e
+            raise
 
         await self._configure_session()
 
@@ -210,7 +304,9 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
             if _debug.DONT_LOG_MODEL_DATA:
                 logger.debug("Session updated")
             else:
-                logger.debug(f"Session updated: {event}")
+                logger.debug("Session updated: %s", event)
+        except _ListenerError:
+            raise
         except TimeoutError as e:
             wrapped_err = STTWebsocketConnectionError(
                 "Timeout waiting for transcription_session.updated event"
@@ -222,33 +318,85 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
             raise
 
     async def _handle_events(self) -> None:
+        pending_transcripts: set[str] = set()
+        input_cleared = False
         while True:
             try:
                 event = await asyncio.wait_for(
                     self._event_queue.get(), timeout=EVENT_INACTIVITY_TIMEOUT
                 )
+                if isinstance(event, _InputCompleteSentinel):
+                    self._final_commit_id = uuid4().hex
+                    assert self._websocket is not None, "Websocket not initialized"
+                    await self._websocket.send(
+                        json.dumps(
+                            {"type": "input_audio_buffer.commit", "event_id": self._final_commit_id}
+                        )
+                    )
+                    # The clear acknowledgement follows the final commit (or its
+                    # empty-buffer error), even when VAD wins the commit race. It
+                    # ends input without cancelling already committed transcripts.
+                    await self._websocket.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                    continue
                 if isinstance(event, WebsocketDoneSentinel):
+                    if (
+                        not self._closing
+                        and self._final_commit_id is not None
+                        and (not input_cleared or pending_transcripts)
+                    ):
+                        raise STTWebsocketConnectionError(
+                            "Websocket closed before final transcription completed"
+                        )
                     # processed all events and websocket is done
                     break
+                if isinstance(event, ErrorSentinel):
+                    raise STTWebsocketConnectionError("Error parsing events") from event.error
 
                 event_type = event.get("type", "unknown")
+                if event_type == "input_audio_buffer.committed":
+                    pending_transcripts.add(event["item_id"])
+                elif event_type == "input_audio_buffer.cleared":
+                    input_cleared = True
+                elif event_type == "conversation.item.input_audio_transcription.failed":
+                    raise STTWebsocketConnectionError("Input audio transcription failed")
                 if event_type in [
                     "input_audio_transcription_completed",  # legacy
                     "conversation.item.input_audio_transcription.completed",
                 ]:
+                    if (
+                        event_type == "input_audio_transcription_completed"
+                        and "item_id" not in event
+                    ):
+                        # Legacy sessions don't identify individual completed items;
+                        # each completion still settles one outstanding transcript.
+                        if pending_transcripts:
+                            pending_transcripts.pop()
+                    else:
+                        pending_transcripts.discard(event.get("item_id", ""))
                     transcript = cast(str, event.get("transcript", ""))
                     if len(transcript) > 0:
                         self._end_turn(transcript)
                         self._start_turn()
                         await self._output_queue.put(transcript)
+                if self._final_commit_id is not None and input_cleared and not pending_transcripts:
+                    break
                 await asyncio.sleep(0)  # yield control
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
+                if self._final_commit_id is not None:
+                    error = STTWebsocketConnectionError("Timeout waiting for final transcription")
+                    await self._output_queue.put(ErrorSentinel(error))
+                    raise error from e
                 # No new events for a while. Assume the session is done.
                 break
             except Exception as e:
                 await self._output_queue.put(ErrorSentinel(e))
-                raise e
-        await self._output_queue.put(SessionCompleteSentinel())
+                raise
+        self._signal_completion()
+
+    def _signal_completion(self) -> None:
+        if not self._completion_signaled:
+            self._completion_signaled = True
+            self._output_queue.put_nowait(SessionCompleteSentinel())
 
     async def _stream_audio(
         self, audio_queue: asyncio.Queue[npt.NDArray[np.int16 | np.float32] | None]
@@ -258,15 +406,19 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
         while True:
             buffer = await audio_queue.get()
             if buffer is None:
+                await self._event_queue.put(_InputCompleteSentinel())
                 break
 
-            self._turn_audio_buffer.append(buffer)
+            if self._trace_include_sensitive_audio_data:
+                # The buffer is only read back to populate the span input, so retaining it
+                # when audio tracing is off would hold a whole turn of PCM for nothing.
+                self._turn_audio_buffer.append(buffer)
             try:
                 await self._websocket.send(
                     json.dumps(
                         {
                             "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(buffer.tobytes()).decode("utf-8"),
+                            "audio": _audio_buffer_to_base64(buffer),
                         }
                     )
                 )
@@ -274,18 +426,17 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
                 break
             except Exception as e:
                 await self._output_queue.put(ErrorSentinel(e))
-                raise e
+                raise
 
             await asyncio.sleep(0)  # yield control
 
     async def _process_websocket_connection(self) -> None:
         try:
+            await refresh_openai_client_api_key_if_supported(self._client)
             async with websockets.connect(
-                "wss://api.openai.com/v1/realtime?intent=transcription",
-                additional_headers={
-                    "Authorization": f"Bearer {self._client.api_key}",
-                    "OpenAI-Log-Session": "1",
-                },
+                _prepare_websocket_url(self._client),
+                additional_headers=_prepare_websocket_headers(self._client),
+                logger=get_openai_websocket_logger(),
             ) as ws:
                 await self._setup_connection(ws)
                 self._process_events_task = asyncio.create_task(self._handle_events())
@@ -296,78 +447,142 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
                 else:
                     logger.error("Listener task not initialized")
                     raise AgentsException("Listener task not initialized")
+        except _ListenerError as e:
+            if self._process_events_task is None:
+                self._process_events_task = asyncio.create_task(self._handle_events())
+            await self._process_events_task
+            raise STTWebsocketConnectionError("Error parsing events") from e.__cause__
         except Exception as e:
             await self._output_queue.put(ErrorSentinel(e))
-            raise e
+            raise
 
     def _check_errors(self) -> None:
-        if self._connection_task and self._connection_task.done():
+        if (
+            self._connection_task
+            and self._connection_task.done()
+            and not self._connection_task.cancelled()
+        ):
             exc = self._connection_task.exception()
-            if exc and isinstance(exc, Exception):
+            if isinstance(exc, Exception):
                 self._stored_exception = exc
 
-        if self._process_events_task and self._process_events_task.done():
+        if (
+            self._process_events_task
+            and self._process_events_task.done()
+            and not self._process_events_task.cancelled()
+        ):
             exc = self._process_events_task.exception()
-            if exc and isinstance(exc, Exception):
+            if isinstance(exc, Exception):
                 self._stored_exception = exc
 
-        if self._stream_audio_task and self._stream_audio_task.done():
+        if (
+            self._stream_audio_task
+            and self._stream_audio_task.done()
+            and not self._stream_audio_task.cancelled()
+        ):
             exc = self._stream_audio_task.exception()
-            if exc and isinstance(exc, Exception):
+            if isinstance(exc, Exception):
                 self._stored_exception = exc
 
-        if self._listener_task and self._listener_task.done():
+        if (
+            self._listener_task
+            and self._listener_task.done()
+            and not self._listener_task.cancelled()
+        ):
             exc = self._listener_task.exception()
-            if exc and isinstance(exc, Exception):
+            if isinstance(exc, Exception):
                 self._stored_exception = exc
 
-    def _cleanup_tasks(self) -> None:
-        if self._listener_task and not self._listener_task.done():
-            self._listener_task.cancel()
+    async def _cleanup_tasks(self) -> None:
+        owned_tasks = [
+            task
+            for task in (
+                self._listener_task,
+                self._process_events_task,
+                self._stream_audio_task,
+                self._connection_task,
+            )
+            if task is not None and task is not asyncio.current_task()
+        ]
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
 
-        if self._process_events_task and not self._process_events_task.done():
-            self._process_events_task.cancel()
-
-        if self._stream_audio_task and not self._stream_audio_task.done():
-            self._stream_audio_task.cancel()
-
-        if self._connection_task and not self._connection_task.done():
-            self._connection_task.cancel()
+        if owned_tasks:
+            await asyncio.gather(*owned_tasks, return_exceptions=True)
 
     async def transcribe_turns(self) -> AsyncIterator[str]:
         self._connection_task = asyncio.create_task(self._process_websocket_connection())
 
-        while True:
-            try:
+        primary_exception: BaseException | None = None
+        try:
+            while True:
                 turn = await self._output_queue.get()
-            except asyncio.CancelledError:
-                break
+                if (
+                    turn is None
+                    or isinstance(turn, ErrorSentinel)
+                    or isinstance(turn, SessionCompleteSentinel)
+                ):
+                    self._output_queue.task_done()
+                    break
+                try:
+                    yield turn
+                finally:
+                    self._output_queue.task_done()
+        except BaseException as exc:
+            primary_exception = exc
+            raise
+        finally:
+            cleanup_exception: BaseException | None = None
+            try:
+                await self.close()
+            except BaseException as exc:
+                cleanup_exception = exc
 
-            if (
-                turn is None
-                or isinstance(turn, ErrorSentinel)
-                or isinstance(turn, SessionCompleteSentinel)
-            ):
-                self._output_queue.task_done()
-                break
-            yield turn
-            self._output_queue.task_done()
+            # Closing drains the owned tasks, so inspect their final outcomes before choosing
+            # between the session error and a secondary cleanup failure.
+            self._check_errors()
+            task_exception = self._stored_exception
+            preserve_primary_exception = primary_exception is not None
+            exception_to_raise: BaseException | None = None
+            if isinstance(primary_exception, asyncio.CancelledError):
+                pass
+            elif isinstance(cleanup_exception, asyncio.CancelledError):
+                exception_to_raise = cleanup_exception
+            elif preserve_primary_exception:
+                pass
+            elif task_exception is not None:
+                exception_to_raise = task_exception
+            elif cleanup_exception is not None:
+                exception_to_raise = cleanup_exception
 
-        if self._tracing_span:
-            self._end_turn("")
+            cleanup_exception_was_suppressed = (
+                cleanup_exception is not None
+                and not isinstance(cleanup_exception, asyncio.CancelledError)
+                and cleanup_exception is not exception_to_raise
+            )
+            if cleanup_exception_was_suppressed:
+                try:
+                    logger.warning("STT session cleanup failed while preserving another exception")
+                except Exception:
+                    # Logging must not replace the selected exception.
+                    pass
 
-        if self._websocket:
-            await self._websocket.close()
-
-        self._check_errors()
-        if self._stored_exception:
-            raise self._stored_exception
+            if exception_to_raise is not None:
+                raise exception_to_raise
 
     async def close(self) -> None:
-        if self._websocket:
-            await self._websocket.close()
-
-        self._cleanup_tasks()
+        self._closing = True
+        try:
+            if self._websocket:
+                await self._websocket.close()
+        finally:
+            try:
+                await self._cleanup_tasks()
+            finally:
+                self._end_turn("")
+                # Closing during setup may leave no event processor to notify the consumer.
+                self._signal_completion()
 
 
 class OpenAISTTModel(STTModel):
@@ -417,7 +632,11 @@ class OpenAISTTModel(STTModel):
             model_config={
                 "temperature": self._non_null_or_not_given(settings.temperature),
                 "language": self._non_null_or_not_given(settings.language),
-                "prompt": self._non_null_or_not_given(settings.prompt),
+                "prompt": (
+                    self._non_null_or_not_given(settings.prompt)
+                    if trace_include_sensitive_data
+                    else None
+                ),
             },
         ) as span:
             try:
@@ -425,7 +644,16 @@ class OpenAISTTModel(STTModel):
                     model=self.model,
                     file=input.to_audio_file(),
                     prompt=self._non_null_or_not_given(settings.prompt),
-                    language=self._non_null_or_not_given(settings.language),
+                    language=(
+                        omit
+                        if self.model == "gpt-transcribe"
+                        else self._non_null_or_not_given(settings.language)
+                    ),
+                    extra_body=(
+                        {"languages": [settings.language]}
+                        if self.model == "gpt-transcribe" and settings.language is not None
+                        else None
+                    ),
                     temperature=self._non_null_or_not_given(settings.temperature),
                 )
                 if trace_include_sensitive_data:
@@ -433,8 +661,16 @@ class OpenAISTTModel(STTModel):
                 return response.text
             except Exception as e:
                 span.span_data.output = ""
-                span.set_error(SpanError(message=str(e), data={}))
-                raise e
+                span.set_error(
+                    SpanError(
+                        message=get_trace_error(
+                            trace_include_sensitive_data=trace_include_sensitive_data,
+                            error_message=str(e),
+                        ),
+                        data={},
+                    )
+                )
+                raise
 
     async def create_session(
         self,

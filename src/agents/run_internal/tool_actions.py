@@ -6,9 +6,11 @@ functions and approval plumbing live in tool_execution.py.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import inspect
 import json
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from openai.types.responses import ResponseComputerToolCall
@@ -20,27 +22,35 @@ from openai.types.responses.response_input_param import ComputerCallOutput
 from .._tool_identity import get_mapping_or_attr, get_tool_trace_name_for_tool
 from ..agent import Agent
 from ..exceptions import ModelBehaviorError
-from ..items import RunItem, ToolCallOutputItem
+from ..items import ItemHelpers, RunItem, ToolApprovalItem, ToolCallOutputItem
 from ..logger import logger
 from ..run_config import RunConfig
 from ..run_context import RunContextWrapper
 from ..tool import (
     ApplyPatchTool,
+    ApplyPatchToolCustomDataContext,
+    ComputerToolCustomDataContext,
+    CustomTool,
+    CustomToolCustomDataContext,
     LocalShellCommandRequest,
     ShellCommandRequest,
     ShellResult,
     resolve_computer,
 )
+from ..tool_context import ToolContext
 from ..tracing import SpanError
 from ..util import _coro
 from ..util._approvals import evaluate_needs_approval_setting
+from ..util._asyncio_tasks import gather_with_cancel
+from ..util._custom_data import maybe_extract_custom_data
 from .items import apply_patch_rejection_item, shell_rejection_item
 from .tool_execution import (
-    coerce_apply_patch_operation,
+    coerce_apply_patch_operations,
     coerce_shell_call,
     extract_apply_patch_call_id,
     format_shell_error,
     get_trace_tool_error,
+    log_tool_action_error,
     normalize_apply_patch_result,
     normalize_max_output_length,
     normalize_shell_output,
@@ -48,6 +58,7 @@ from .tool_execution import (
     render_shell_outputs,
     resolve_approval_rejection_message,
     resolve_approval_status,
+    run_native_tool_post_invoke,
     serialize_shell_output,
     truncate_shell_outputs,
     with_tool_function_span,
@@ -58,6 +69,7 @@ if TYPE_CHECKING:
     from .run_steps import (
         ToolRunApplyPatchCall,
         ToolRunComputerAction,
+        ToolRunCustom,
         ToolRunLocalShellCall,
         ToolRunShellCall,
     )
@@ -66,6 +78,7 @@ __all__ = [
     "ComputerAction",
     "LocalShellAction",
     "ShellAction",
+    "CustomToolAction",
     "ApplyPatchAction",
 ]
 
@@ -102,12 +115,14 @@ class ComputerAction:
         context_wrapper: RunContextWrapper[Any],
         config: RunConfig,
         acknowledged_safety_checks: list[ComputerCallOutputAcknowledgedSafetyCheck] | None = None,
+        tool_output_committer: Callable[[RunItem], None] | None = None,
+        sibling_category_failure: asyncio.Event | None = None,
     ) -> RunItem:
         """Run a computer action, capturing a screenshot and notifying hooks."""
         trace_tool_name = get_tool_trace_name_for_tool(action.computer_tool) or cls.TRACE_TOOL_NAME
 
         async def _run_action(span: Any | None) -> RunItem:
-            if span and config.trace_include_sensitive_data:
+            if span is not None and config.trace_include_sensitive_data:
                 span.span_data.input = _serialize_trace_payload(
                     cls._get_trace_input_payload(action.tool_call)
                 )
@@ -116,11 +131,15 @@ class ComputerAction:
                 tool=action.computer_tool, run_context=context_wrapper
             )
             agent_hooks = agent.hooks
-            await asyncio.gather(
+            context_wrapper._mark_tool_invocation_executed(
+                action.tool_call,
+                tool_name=action.computer_tool.name,
+            )
+            await gather_with_cancel(
                 hooks.on_tool_start(context_wrapper, agent, action.computer_tool),
                 (
                     agent_hooks.on_tool_start(context_wrapper, agent, action.computer_tool)
-                    if agent_hooks
+                    if agent_hooks is not None
                     else _coro.noop_coroutine()
                 ),
             )
@@ -133,7 +152,7 @@ class ComputerAction:
                     trace_include_sensitive_data=config.trace_include_sensitive_data,
                     error_message=error_text,
                 )
-                if span:
+                if span is not None:
                     span.set_error(
                         SpanError(
                             message="Error running tool",
@@ -143,35 +162,59 @@ class ComputerAction:
                             },
                         )
                     )
-                logger.error("Failed to execute computer action: %s", exc, exc_info=True)
+                log_tool_action_error("Failed to execute computer action", exc)
                 raise
 
-            await asyncio.gather(
-                hooks.on_tool_end(context_wrapper, agent, action.computer_tool, output),
-                (
-                    agent_hooks.on_tool_end(context_wrapper, agent, action.computer_tool, output)
-                    if agent_hooks
-                    else _coro.noop_coroutine()
-                ),
-            )
-
             image_url = f"data:image/png;base64,{output}" if output else ""
-            if span and config.trace_include_sensitive_data:
-                span.span_data.output = image_url
-
-            return ToolCallOutputItem(
+            raw_item = ComputerCallOutput(
+                call_id=action.tool_call.call_id,
+                output={
+                    "type": "computer_screenshot",
+                    "image_url": image_url,
+                },
+                type="computer_call_output",
+                acknowledged_safety_checks=acknowledged_safety_checks,
+            )
+            output_item = ToolCallOutputItem(
                 agent=agent,
                 output=image_url,
-                raw_item=ComputerCallOutput(
-                    call_id=action.tool_call.call_id,
-                    output={
-                        "type": "computer_screenshot",
-                        "image_url": image_url,
-                    },
-                    type="computer_call_output",
-                    acknowledged_safety_checks=acknowledged_safety_checks,
-                ),
+                raw_item=raw_item,
             )
+
+            # Record accepted output before optional metadata and end hooks.
+            if tool_output_committer is not None:
+                tool_output_committer(output_item)
+
+            async def finalize_output() -> None:
+                custom_data = await maybe_extract_custom_data(
+                    action.computer_tool.custom_data_extractor,
+                    ComputerToolCustomDataContext(
+                        run_context=context_wrapper,
+                        tool=action.computer_tool,
+                        tool_call=action.tool_call,
+                        output=image_url,
+                        raw_item=copy.deepcopy(raw_item),
+                    ),
+                )
+                output_item.custom_data = custom_data
+
+                await gather_with_cancel(
+                    hooks.on_tool_end(context_wrapper, agent, action.computer_tool, output),
+                    (
+                        agent_hooks.on_tool_end(
+                            context_wrapper, agent, action.computer_tool, output
+                        )
+                        if agent_hooks is not None
+                        else _coro.noop_coroutine()
+                    ),
+                )
+
+            await run_native_tool_post_invoke(finalize_output(), sibling_category_failure)
+
+            if span is not None and config.trace_include_sensitive_data:
+                span.span_data.output = image_url
+
+            return output_item
 
         return await with_tool_function_span(
             config=config,
@@ -185,17 +228,23 @@ class ComputerAction:
     ) -> str:
         """Execute computer actions (sync or async drivers) and return the final screenshot."""
 
-        async def maybe_call(method_name: str, *args: Any) -> Any:
+        async def maybe_call(method_name: str, *args: Any, **kwargs: Any) -> Any:
             method = getattr(computer, method_name, None)
             if method is None or not callable(method):
                 raise ModelBehaviorError(f"Computer driver missing method {method_name}")
-            result = method(*args)
+            filtered_kwargs = cls._filter_supported_kwargs(
+                method_name=method_name,
+                method=method,
+                kwargs=kwargs,
+            )
+            result = method(*args, **filtered_kwargs)
             return await result if inspect.isawaitable(result) else result
 
         last_action_was_screenshot = False
         last_screenshot_result: Any = None
         for action in cls._iter_actions(tool_call):
             action_type = get_mapping_or_attr(action, "type")
+            action_keys = cls._normalize_modifier_keys(get_mapping_or_attr(action, "keys"))
             last_action_was_screenshot = False
             if action_type == "click":
                 await maybe_call(
@@ -203,12 +252,14 @@ class ComputerAction:
                     get_mapping_or_attr(action, "x"),
                     get_mapping_or_attr(action, "y"),
                     get_mapping_or_attr(action, "button"),
+                    keys=action_keys,
                 )
             elif action_type == "double_click":
                 await maybe_call(
                     "double_click",
                     get_mapping_or_attr(action, "x"),
                     get_mapping_or_attr(action, "y"),
+                    keys=action_keys,
                 )
             elif action_type == "drag":
                 path = get_mapping_or_attr(action, "path") or []
@@ -221,6 +272,7 @@ class ComputerAction:
                         )
                         for point in path
                     ],
+                    keys=action_keys,
                 )
             elif action_type == "keypress":
                 await maybe_call("keypress", get_mapping_or_attr(action, "keys"))
@@ -229,6 +281,7 @@ class ComputerAction:
                     "move",
                     get_mapping_or_attr(action, "x"),
                     get_mapping_or_attr(action, "y"),
+                    keys=action_keys,
                 )
             elif action_type == "screenshot":
                 last_screenshot_result = await maybe_call("screenshot")
@@ -240,6 +293,7 @@ class ComputerAction:
                     get_mapping_or_attr(action, "y"),
                     get_mapping_or_attr(action, "scroll_x"),
                     get_mapping_or_attr(action, "scroll_y"),
+                    keys=action_keys,
                 )
             elif action_type == "type":
                 await maybe_call("type", get_mapping_or_attr(action, "text"))
@@ -285,6 +339,64 @@ class ComputerAction:
             return dataclasses.asdict(action)
         return action
 
+    @staticmethod
+    def _normalize_modifier_keys(keys: Any) -> list[str] | None:
+        if not keys:
+            return None
+        return cast(list[str], keys)
+
+    @classmethod
+    def _filter_supported_kwargs(
+        cls,
+        *,
+        method_name: str,
+        method: Any,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        filtered_kwargs = {key: value for key, value in kwargs.items() if value is not None}
+        if not filtered_kwargs:
+            return {}
+
+        supported_kwargs = cls._supported_keyword_arguments(method)
+        unsupported_kwargs = [
+            key
+            for key in filtered_kwargs
+            if key not in supported_kwargs and None not in supported_kwargs
+        ]
+        if unsupported_kwargs:
+            logger.warning(
+                "Computer driver method %r does not accept keyword argument(s) %s; "
+                "dropping them and continuing.",
+                method_name,
+                ", ".join(sorted(unsupported_kwargs)),
+            )
+            for key in unsupported_kwargs:
+                filtered_kwargs.pop(key, None)
+
+        return filtered_kwargs
+
+    @staticmethod
+    def _supported_keyword_arguments(method: Any) -> set[str | None]:
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return set()
+        supported: set[str | None] = {
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in {
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+        }
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            supported.add(None)
+        return supported
+
 
 class LocalShellAction:
     """Execute local shell commands via the LocalShellTool with lifecycle hooks."""
@@ -298,14 +410,20 @@ class LocalShellAction:
         hooks: RunHooks[Any],
         context_wrapper: RunContextWrapper[Any],
         config: RunConfig,
+        tool_output_committer: Callable[[RunItem], None] | None = None,
+        sibling_category_failure: asyncio.Event | None = None,
     ) -> RunItem:
         """Run a local shell tool call and wrap the result as a ToolCallOutputItem."""
         agent_hooks = agent.hooks
-        await asyncio.gather(
+        context_wrapper._mark_tool_invocation_executed(
+            call.tool_call,
+            tool_name=call.local_shell_tool.name,
+        )
+        await gather_with_cancel(
             hooks.on_tool_start(context_wrapper, agent, call.local_shell_tool),
             (
                 agent_hooks.on_tool_start(context_wrapper, agent, call.local_shell_tool)
-                if agent_hooks
+                if agent_hooks is not None
                 else _coro.noop_coroutine()
             ),
         )
@@ -317,25 +435,33 @@ class LocalShellAction:
         output = call.local_shell_tool.executor(request)
         result = await output if inspect.isawaitable(output) else output
 
-        await asyncio.gather(
-            hooks.on_tool_end(context_wrapper, agent, call.local_shell_tool, result),
-            (
-                agent_hooks.on_tool_end(context_wrapper, agent, call.local_shell_tool, result)
-                if agent_hooks
-                else _coro.noop_coroutine()
-            ),
-        )
-
         raw_payload: dict[str, Any] = {
             "type": "local_shell_call_output",
             "call_id": call.tool_call.call_id,
             "output": result,
         }
-        return ToolCallOutputItem(
+        output_item = ToolCallOutputItem(
             agent=agent,
             output=result,
             raw_item=raw_payload,
         )
+
+        async def finalize_output() -> None:
+            if tool_output_committer is not None:
+                tool_output_committer(output_item)
+
+            await gather_with_cancel(
+                hooks.on_tool_end(context_wrapper, agent, call.local_shell_tool, result),
+                (
+                    agent_hooks.on_tool_end(context_wrapper, agent, call.local_shell_tool, result)
+                    if agent_hooks is not None
+                    else _coro.noop_coroutine()
+                ),
+            )
+
+        await run_native_tool_post_invoke(finalize_output(), sibling_category_failure)
+
+        return output_item
 
 
 class ShellAction:
@@ -350,23 +476,46 @@ class ShellAction:
         hooks: RunHooks[Any],
         context_wrapper: RunContextWrapper[Any],
         config: RunConfig,
+        tool_output_committer: Callable[[RunItem], None] | None = None,
+        sibling_category_failure: asyncio.Event | None = None,
     ) -> RunItem:
         """Run a shell tool call and return a normalized ToolCallOutputItem."""
         shell_call = coerce_shell_call(call.tool_call)
         shell_tool = call.shell_tool
         agent_hooks = agent.hooks
+        current_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=call.tool_call,
+            tool_name=shell_tool.name,
+        )
 
         async def _run_call(span: Any | None) -> RunItem:
-            if span and config.trace_include_sensitive_data:
+            if span is not None and config.trace_include_sensitive_data:
                 span.span_data.input = _serialize_trace_payload(
                     dataclasses.asdict(shell_call.action)
                 )
 
-            needs_approval_result = await evaluate_needs_approval_setting(
-                shell_tool.needs_approval, context_wrapper, shell_call.action, shell_call.call_id
+            approval_status = context_wrapper.get_approval_status(
+                shell_tool.name,
+                shell_call.call_id,
+                current_invocation=current_item,
             )
+            if approval_status is None:
+                needs_approval_result = await evaluate_needs_approval_setting(
+                    shell_tool.needs_approval,
+                    context_wrapper,
+                    shell_call.action,
+                    shell_call.call_id,
+                )
+                approval_status = context_wrapper.get_approval_status(
+                    shell_tool.name,
+                    shell_call.call_id,
+                    current_invocation=current_item,
+                )
+            else:
+                needs_approval_result = False
 
-            if needs_approval_result:
+            if approval_status is None and needs_approval_result:
                 approval_status, approval_item = await resolve_approval_status(
                     tool_name=shell_tool.name,
                     call_id=shell_call.call_id,
@@ -376,28 +525,35 @@ class ShellAction:
                     on_approval=shell_tool.on_approval,
                 )
 
-                if approval_status is False:
-                    rejection_message = await resolve_approval_rejection_message(
-                        context_wrapper=context_wrapper,
-                        run_config=config,
-                        tool_type="shell",
-                        tool_name=shell_tool.name,
-                        call_id=shell_call.call_id,
-                    )
-                    return shell_rejection_item(
-                        agent,
-                        shell_call.call_id,
-                        rejection_message=rejection_message,
-                    )
-
-                if approval_status is not True:
+                if approval_status is None:
                     return approval_item
 
-            await asyncio.gather(
+            if approval_status is False:
+                rejection_message = await resolve_approval_rejection_message(
+                    context_wrapper=context_wrapper,
+                    run_config=config,
+                    tool_call=call.tool_call,
+                    tool_type="shell",
+                    tool_name=shell_tool.name,
+                    call_id=shell_call.call_id,
+                    existing_pending=current_item,
+                )
+                return shell_rejection_item(
+                    agent,
+                    shell_call.call_id,
+                    tool_call=call.tool_call,
+                    rejection_message=rejection_message,
+                )
+
+            context_wrapper._mark_tool_invocation_executed(
+                call.tool_call,
+                tool_name=shell_tool.name,
+            )
+            await gather_with_cancel(
                 hooks.on_tool_start(context_wrapper, agent, shell_tool),
                 (
                     agent_hooks.on_tool_start(context_wrapper, agent, shell_tool)
-                    if agent_hooks
+                    if agent_hooks is not None
                     else _coro.noop_coroutine()
                 ),
             )
@@ -452,7 +608,7 @@ class ShellAction:
                     trace_include_sensitive_data=config.trace_include_sensitive_data,
                     error_message=output_text,
                 )
-                if span:
+                if span is not None:
                     span.set_error(
                         SpanError(
                             message="Error running tool",
@@ -465,16 +621,7 @@ class ShellAction:
                 if requested_max_output_length is not None:
                     max_output_length = requested_max_output_length
                     output_text = output_text[:max_output_length]
-                logger.error("Shell executor failed: %s", exc, exc_info=True)
-
-            await asyncio.gather(
-                hooks.on_tool_end(context_wrapper, agent, call.shell_tool, output_text),
-                (
-                    agent_hooks.on_tool_end(context_wrapper, agent, call.shell_tool, output_text)
-                    if agent_hooks
-                    else _coro.noop_coroutine()
-                ),
-            )
+                log_tool_action_error("Shell executor failed", exc)
 
             raw_entries: list[dict[str, Any]] | None = None
             if shell_output_payload:
@@ -497,6 +644,7 @@ class ShellAction:
                 "output": structured_output,
                 "status": status,
             }
+            ItemHelpers.copy_tool_call_caller(call.tool_call, raw_item)
             if max_output_length is not None:
                 raw_item["max_output_length"] = max_output_length
             if raw_entries:
@@ -504,19 +652,254 @@ class ShellAction:
             if provider_meta:
                 raw_item["provider_data"] = provider_meta
 
-            if span and config.trace_include_sensitive_data:
-                span.span_data.output = output_text
-
-            return ToolCallOutputItem(
+            output_item = ToolCallOutputItem(
                 agent=agent,
                 output=output_text,
                 raw_item=raw_item,
             )
 
+            async def finalize_output() -> None:
+                if tool_output_committer is not None:
+                    tool_output_committer(output_item)
+
+                await gather_with_cancel(
+                    hooks.on_tool_end(context_wrapper, agent, call.shell_tool, output_text),
+                    (
+                        agent_hooks.on_tool_end(
+                            context_wrapper, agent, call.shell_tool, output_text
+                        )
+                        if agent_hooks is not None
+                        else _coro.noop_coroutine()
+                    ),
+                )
+
+            await run_native_tool_post_invoke(finalize_output(), sibling_category_failure)
+
+            if span is not None and config.trace_include_sensitive_data:
+                span.span_data.output = output_text
+
+            return output_item
+
         return await with_tool_function_span(
             config=config,
             tool_name=shell_tool.name,
             fn=_run_call,
+        )
+
+
+class CustomToolAction:
+    """Execute Responses custom tool calls and return custom_tool_call_output items."""
+
+    @classmethod
+    async def execute(
+        cls,
+        *,
+        agent: Agent[Any],
+        call: ToolRunCustom,
+        hooks: RunHooks[Any],
+        context_wrapper: RunContextWrapper[Any],
+        config: RunConfig,
+        tool_output_committer: Callable[[RunItem], None] | None = None,
+        sibling_category_failure: asyncio.Event | None = None,
+    ) -> RunItem:
+        custom_tool: CustomTool = call.custom_tool
+        agent_hooks = agent.hooks
+        call_id = get_mapping_or_attr(call.tool_call, "call_id")
+        tool_input = get_mapping_or_attr(call.tool_call, "input")
+        if not isinstance(call_id, str) or not call_id:
+            raise ModelBehaviorError("Custom tool call is missing a non-empty call_id.")
+        if not isinstance(tool_input, str):
+            raise ModelBehaviorError("Custom tool call is missing input.")
+
+        tool_context = ToolContext.from_agent_context(
+            context_wrapper,
+            call_id,
+            tool_name=custom_tool.name,
+            tool_arguments=tool_input,
+            agent=agent,
+            run_config=config,
+        )
+        current_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=call.tool_call,
+            tool_name=custom_tool.name,
+        )
+
+        async def _run_call(span: Any | None) -> RunItem:
+            if span is not None and config.trace_include_sensitive_data:
+                span.span_data.input = tool_input
+
+            approval_status = context_wrapper.get_approval_status(
+                custom_tool.name,
+                call_id,
+                current_invocation=current_item,
+            )
+            if approval_status is None:
+                needs_approval_result = await evaluate_needs_approval_setting(
+                    custom_tool.runtime_needs_approval(), context_wrapper, tool_input, call_id
+                )
+                approval_status = context_wrapper.get_approval_status(
+                    custom_tool.name,
+                    call_id,
+                    current_invocation=current_item,
+                )
+            else:
+                needs_approval_result = False
+
+            if approval_status is None and needs_approval_result:
+                approval_status, approval_item = await resolve_approval_status(
+                    tool_name=custom_tool.name,
+                    call_id=call_id,
+                    raw_item=call.tool_call,
+                    agent=agent,
+                    context_wrapper=context_wrapper,
+                    on_approval=custom_tool.runtime_on_approval(),
+                )
+
+                if approval_status is None:
+                    return approval_item
+
+            if approval_status is False:
+                rejection_message = await resolve_approval_rejection_message(
+                    context_wrapper=context_wrapper,
+                    run_config=config,
+                    tool_call=call.tool_call,
+                    tool_type="custom",
+                    tool_name=custom_tool.name,
+                    call_id=call_id,
+                    existing_pending=current_item,
+                )
+                return cls._tool_output_item(
+                    agent,
+                    call_id,
+                    rejection_message,
+                    raw_item=cls._raw_tool_output_item(
+                        call_id,
+                        rejection_message,
+                        tool_call=call.tool_call,
+                    ),
+                )
+
+            context_wrapper._mark_tool_invocation_executed(
+                call.tool_call,
+                tool_name=custom_tool.name,
+            )
+            await gather_with_cancel(
+                hooks.on_tool_start(tool_context, agent, custom_tool),
+                (
+                    agent_hooks.on_tool_start(tool_context, agent, custom_tool)
+                    if agent_hooks is not None
+                    else _coro.noop_coroutine()
+                ),
+            )
+
+            try:
+                result = custom_tool.on_invoke_tool(tool_context, tool_input)
+                result = await result if inspect.isawaitable(result) else result
+                output_text = cls._normalize_output(result)
+            except Exception as exc:
+                output_text = format_shell_error(exc)
+                trace_error = get_trace_tool_error(
+                    trace_include_sensitive_data=config.trace_include_sensitive_data,
+                    error_message=output_text,
+                )
+                if span is not None:
+                    span.set_error(
+                        SpanError(
+                            message="Error running tool",
+                            data={
+                                "tool_name": custom_tool.name,
+                                "error": trace_error,
+                            },
+                        )
+                    )
+                log_tool_action_error("Custom tool failed", exc)
+
+            raw_item = cls._raw_tool_output_item(
+                call_id,
+                output_text,
+                tool_call=call.tool_call,
+            )
+            output_item = cls._tool_output_item(
+                agent,
+                call_id,
+                output_text,
+                raw_item=raw_item,
+            )
+
+            # Record accepted output before optional metadata and end hooks.
+            if tool_output_committer is not None:
+                tool_output_committer(output_item)
+
+            async def finalize_output() -> None:
+                custom_data = await maybe_extract_custom_data(
+                    custom_tool.custom_data_extractor,
+                    CustomToolCustomDataContext(
+                        tool_context=tool_context,
+                        tool=custom_tool,
+                        input=tool_input,
+                        output=output_text,
+                        raw_item=copy.deepcopy(raw_item),
+                    ),
+                )
+                output_item.custom_data = custom_data
+
+                await gather_with_cancel(
+                    hooks.on_tool_end(tool_context, agent, custom_tool, output_text),
+                    (
+                        agent_hooks.on_tool_end(tool_context, agent, custom_tool, output_text)
+                        if agent_hooks is not None
+                        else _coro.noop_coroutine()
+                    ),
+                )
+
+            await run_native_tool_post_invoke(finalize_output(), sibling_category_failure)
+
+            if span is not None and config.trace_include_sensitive_data:
+                span.span_data.output = output_text
+            return output_item
+
+        return await with_tool_function_span(
+            config=config,
+            tool_name=custom_tool.name,
+            fn=_run_call,
+        )
+
+    @staticmethod
+    def _normalize_output(output: Any) -> str:
+        return output if isinstance(output, str) else str(output)
+
+    @staticmethod
+    def _raw_tool_output_item(
+        call_id: str,
+        output: str,
+        *,
+        tool_call: Any | None = None,
+    ) -> dict[str, Any]:
+        raw_item = {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": output,
+        }
+        if tool_call is not None:
+            ItemHelpers.copy_tool_call_caller(tool_call, raw_item)
+        return raw_item
+
+    @classmethod
+    def _tool_output_item(
+        cls,
+        agent: Agent[Any],
+        call_id: str,
+        output: str,
+        *,
+        raw_item: dict[str, Any] | None = None,
+        custom_data: dict[str, Any] | None = None,
+    ) -> ToolCallOutputItem:
+        return ToolCallOutputItem(
+            agent=agent,
+            output=output,
+            raw_item=cast(Any, raw_item or cls._raw_tool_output_item(call_id, output)),
+            custom_data=custom_data,
         )
 
 
@@ -532,31 +915,56 @@ class ApplyPatchAction:
         hooks: RunHooks[Any],
         context_wrapper: RunContextWrapper[Any],
         config: RunConfig,
+        tool_output_committer: Callable[[RunItem], None] | None = None,
+        sibling_category_failure: asyncio.Event | None = None,
     ) -> RunItem:
         """Run an apply_patch call and serialize the editor result for the model."""
         apply_patch_tool: ApplyPatchTool = call.apply_patch_tool
         agent_hooks = agent.hooks
-        operation = coerce_apply_patch_operation(
+        operations = coerce_apply_patch_operations(
             call.tool_call,
             context_wrapper=context_wrapper,
         )
         call_id = extract_apply_patch_call_id(call.tool_call)
+        current_item = ToolApprovalItem(
+            agent=agent,
+            raw_item=call.tool_call,
+            tool_name=apply_patch_tool.name,
+        )
 
         async def _run_call(span: Any | None) -> RunItem:
-            if span and config.trace_include_sensitive_data:
+            if span is not None and config.trace_include_sensitive_data:
                 span.span_data.input = _serialize_trace_payload(
-                    {
-                        "type": operation.type,
-                        "path": operation.path,
-                        "diff": operation.diff,
-                    }
+                    [
+                        {
+                            "type": operation.type,
+                            "path": operation.path,
+                            "diff": operation.diff,
+                        }
+                        for operation in operations
+                    ]
                 )
 
-            needs_approval_result = await evaluate_needs_approval_setting(
-                apply_patch_tool.needs_approval, context_wrapper, operation, call_id
+            approval_status = context_wrapper.get_approval_status(
+                apply_patch_tool.name,
+                call_id,
+                current_invocation=current_item,
             )
+            needs_approval_result = False
+            if approval_status is None:
+                for operation in operations:
+                    needs_approval_result = await evaluate_needs_approval_setting(
+                        apply_patch_tool.needs_approval, context_wrapper, operation, call_id
+                    )
+                    approval_status = context_wrapper.get_approval_status(
+                        apply_patch_tool.name,
+                        call_id,
+                        current_invocation=current_item,
+                    )
+                    if approval_status is not None or needs_approval_result:
+                        break
 
-            if needs_approval_result:
+            if approval_status is None and needs_approval_result:
                 approval_status, approval_item = await resolve_approval_status(
                     tool_name=apply_patch_tool.name,
                     call_id=call_id,
@@ -566,28 +974,36 @@ class ApplyPatchAction:
                     on_approval=apply_patch_tool.on_approval,
                 )
 
-                if approval_status is False:
-                    rejection_message = await resolve_approval_rejection_message(
-                        context_wrapper=context_wrapper,
-                        run_config=config,
-                        tool_type="apply_patch",
-                        tool_name=apply_patch_tool.name,
-                        call_id=call_id,
-                    )
-                    return apply_patch_rejection_item(
-                        agent,
-                        call_id,
-                        rejection_message=rejection_message,
-                    )
-
-                if approval_status is not True:
+                if approval_status is None:
                     return approval_item
 
-            await asyncio.gather(
+            if approval_status is False:
+                rejection_message = await resolve_approval_rejection_message(
+                    context_wrapper=context_wrapper,
+                    run_config=config,
+                    tool_call=call.tool_call,
+                    tool_type="apply_patch",
+                    tool_name=apply_patch_tool.name,
+                    call_id=call_id,
+                    existing_pending=current_item,
+                )
+                return apply_patch_rejection_item(
+                    agent,
+                    call_id,
+                    tool_call=call.tool_call,
+                    output_type="apply_patch_call_output",
+                    rejection_message=rejection_message,
+                )
+
+            context_wrapper._mark_tool_invocation_executed(
+                call.tool_call,
+                tool_name=apply_patch_tool.name,
+            )
+            await gather_with_cancel(
                 hooks.on_tool_start(context_wrapper, agent, apply_patch_tool),
                 (
                     agent_hooks.on_tool_start(context_wrapper, agent, apply_patch_tool)
-                    if agent_hooks
+                    if agent_hooks is not None
                     else _coro.noop_coroutine()
                 ),
             )
@@ -596,23 +1012,30 @@ class ApplyPatchAction:
             output_text = ""
 
             try:
+                operation_outputs: list[str] = []
                 editor = apply_patch_tool.editor
-                if operation.type == "create_file":
-                    result = editor.create_file(operation)
-                elif operation.type == "update_file":
-                    result = editor.update_file(operation)
-                elif operation.type == "delete_file":
-                    result = editor.delete_file(operation)
-                else:  # pragma: no cover - validated in coerce_apply_patch_operation
-                    raise ModelBehaviorError(f"Unsupported apply_patch operation: {operation.type}")
+                for operation in operations:
+                    if operation.type == "create_file":
+                        result = editor.create_file(operation)
+                    elif operation.type == "update_file":
+                        result = editor.update_file(operation)
+                    elif operation.type == "delete_file":
+                        result = editor.delete_file(operation)
+                    else:  # pragma: no cover - validated in coerce_apply_patch_operations
+                        raise ModelBehaviorError(
+                            f"Unsupported apply_patch operation: {operation.type}"
+                        )
 
-                awaited = await result if inspect.isawaitable(result) else result
-                normalized = normalize_apply_patch_result(awaited)
-                if normalized:
-                    if normalized.status in {"completed", "failed"}:
-                        status = normalized.status
-                    if normalized.output:
-                        output_text = normalized.output
+                    awaited = await result if inspect.isawaitable(result) else result
+                    normalized = normalize_apply_patch_result(awaited)
+                    if normalized is not None:
+                        if normalized.status == "failed":
+                            status = "failed"
+                        elif normalized.status == "completed" and status != "failed":
+                            status = "completed"
+                        if normalized.output:
+                            operation_outputs.append(normalized.output)
+                output_text = "\n".join(operation_outputs)
             except Exception as exc:
                 status = "failed"
                 output_text = format_shell_error(exc)
@@ -620,7 +1043,7 @@ class ApplyPatchAction:
                     trace_include_sensitive_data=config.trace_include_sensitive_data,
                     error_message=output_text,
                 )
-                if span:
+                if span is not None:
                     span.set_error(
                         SpanError(
                             message="Error running tool",
@@ -630,33 +1053,58 @@ class ApplyPatchAction:
                             },
                         )
                     )
-                logger.error("Apply patch editor failed: %s", exc, exc_info=True)
-
-            await asyncio.gather(
-                hooks.on_tool_end(context_wrapper, agent, apply_patch_tool, output_text),
-                (
-                    agent_hooks.on_tool_end(context_wrapper, agent, apply_patch_tool, output_text)
-                    if agent_hooks
-                    else _coro.noop_coroutine()
-                ),
-            )
+                log_tool_action_error("Apply patch editor failed", exc)
 
             raw_item: dict[str, Any] = {
                 "type": "apply_patch_call_output",
                 "call_id": call_id,
                 "status": status,
             }
+            ItemHelpers.copy_tool_call_caller(call.tool_call, raw_item)
             if output_text:
                 raw_item["output"] = output_text
 
-            if span and config.trace_include_sensitive_data:
-                span.span_data.output = output_text
-
-            return ToolCallOutputItem(
+            output_item = ToolCallOutputItem(
                 agent=agent,
                 output=output_text,
                 raw_item=raw_item,
             )
+
+            # Record accepted output before optional metadata and end hooks.
+            if tool_output_committer is not None:
+                tool_output_committer(output_item)
+
+            async def finalize_output() -> None:
+                custom_data = await maybe_extract_custom_data(
+                    apply_patch_tool.custom_data_extractor,
+                    ApplyPatchToolCustomDataContext(
+                        run_context=context_wrapper,
+                        tool=apply_patch_tool,
+                        operations=operations,
+                        output=output_text,
+                        status=status,
+                        raw_item=copy.deepcopy(raw_item),
+                    ),
+                )
+                output_item.custom_data = custom_data
+
+                await gather_with_cancel(
+                    hooks.on_tool_end(context_wrapper, agent, apply_patch_tool, output_text),
+                    (
+                        agent_hooks.on_tool_end(
+                            context_wrapper, agent, apply_patch_tool, output_text
+                        )
+                        if agent_hooks is not None
+                        else _coro.noop_coroutine()
+                    ),
+                )
+
+            await run_native_tool_post_invoke(finalize_output(), sibling_category_failure)
+
+            if span is not None and config.trace_include_sensitive_data:
+                span.span_data.output = output_text
+
+            return output_item
 
         return await with_tool_function_span(
             config=config,
@@ -669,5 +1117,6 @@ __all__ = [
     "ComputerAction",
     "LocalShellAction",
     "ShellAction",
+    "CustomToolAction",
     "ApplyPatchAction",
 ]

@@ -7,7 +7,7 @@ import tempfile
 from collections.abc import Mapping
 from typing import Any
 
-from agents import Agent, ImageGenerationTool, Runner, trace
+from agents import Agent, ImageGenerationTool, ImageGenerationToolConfig, Runner, trace
 from examples.auto_mode import is_auto_mode
 
 
@@ -29,12 +29,20 @@ def open_file(path: str) -> None:
 
 
 async def main():
+    image_config: ImageGenerationToolConfig = {
+        "type": "image_generation",
+        "model": "gpt-image-2.5-flare",
+        "action": "generate",
+        "size": "1536x864",
+        # Use xhigh or max for higher quality with GPT Image 2.5 models.
+        "quality": "low",
+    }
     agent = Agent(
         name="Image generator",
         instructions="Always use the image generation tool when the user asks for a new image.",
         tools=[
             ImageGenerationTool(
-                tool_config={"type": "image_generation", "quality": "low"},
+                tool_config=image_config,
             )
         ],
     )
@@ -71,7 +79,7 @@ async def main():
                 open_file(temp_path)
 
         if not generated_image:
-            print("No image_generation_call item was returned.")
+            raise RuntimeError("No image_generation_call item was returned.")
 
 
 if __name__ == "__main__":

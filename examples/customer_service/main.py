@@ -16,10 +16,10 @@ from agents import (
     ToolCallItem,
     ToolCallOutputItem,
     TResponseInputItem,
-    function_tool,
     handoff,
     trace,
 )
+from agents.decorators import tool
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from examples.auto_mode import input_with_fallback, is_auto_mode
 
@@ -36,9 +36,7 @@ class AirlineAgentContext(BaseModel):
 ### TOOLS
 
 
-@function_tool(
-    name_override="faq_lookup_tool", description_override="Lookup frequently asked questions."
-)
+@tool(name_override="faq_lookup_tool", description_override="Lookup frequently asked questions.")
 async def faq_lookup_tool(question: str) -> str:
     question_lower = question.lower()
     if any(
@@ -64,7 +62,7 @@ async def faq_lookup_tool(question: str) -> str:
     return "I'm sorry, I don't know the answer to that question."
 
 
-@function_tool
+@tool
 async def update_seat(
     context: RunContextWrapper[AirlineAgentContext], confirmation_number: str, new_seat: str
 ) -> str:
@@ -128,13 +126,21 @@ triage_agent = Agent[AirlineAgentContext](
         "You are a helpful triaging agent. You can use your tools to delegate questions to other appropriate agents."
     ),
     handoffs=[
-        faq_agent,
-        handoff(agent=seat_booking_agent, on_handoff=on_seat_booking_handoff),
+        handoff(agent=faq_agent, tool_name_override="transfer_to_faq_agent"),
+        handoff(
+            agent=seat_booking_agent,
+            on_handoff=on_seat_booking_handoff,
+            tool_name_override="transfer_to_seat_booking_agent",
+        ),
     ],
 )
 
-faq_agent.handoffs.append(triage_agent)
-seat_booking_agent.handoffs.append(triage_agent)
+faq_agent.handoffs.append(
+    handoff(agent=triage_agent, tool_name_override="transfer_to_triage_agent")
+)
+seat_booking_agent.handoffs.append(
+    handoff(agent=triage_agent, tool_name_override="transfer_to_triage_agent")
+)
 
 
 ### RUN

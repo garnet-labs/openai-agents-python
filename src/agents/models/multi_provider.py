@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import Literal, cast
+import asyncio
+from typing import Any, Literal, cast
 
 from openai import AsyncOpenAI
 
 from ..exceptions import UserError
 from .interface import Model, ModelProvider
+from .openai_agent_registration import OpenAIAgentRegistrationConfig
 from .openai_provider import OpenAIProvider
+from .openai_responses import OpenAIResponsesWebSocketOptions
 
 MultiProviderOpenAIPrefixMode = Literal["alias", "model_id"]
 MultiProviderUnknownPrefixMode = Literal["error", "model_id"]
@@ -81,9 +84,13 @@ class MultiProvider(ModelProvider):
         openai_project: str | None = None,
         openai_use_responses: bool | None = None,
         openai_use_responses_websocket: bool | None = None,
+        openai_strict_feature_validation: bool = False,
         openai_websocket_base_url: str | None = None,
         openai_prefix_mode: MultiProviderOpenAIPrefixMode = "alias",
         unknown_prefix_mode: MultiProviderUnknownPrefixMode = "error",
+        openai_agent_registration: OpenAIAgentRegistrationConfig | dict[str, Any] | None = None,
+        openai_responses_websocket_options: OpenAIResponsesWebSocketOptions | None = None,
+        openai_buffer_streamed_tool_calls: bool = False,
     ) -> None:
         """Create a new OpenAI provider.
 
@@ -102,6 +109,10 @@ class MultiProvider(ModelProvider):
             openai_use_responses: Whether to use the OpenAI responses API.
             openai_use_responses_websocket: Whether to use websocket transport for the OpenAI
                 responses API.
+            openai_strict_feature_validation: Whether OpenAI Chat Completions models should raise
+                a UserError when callers pass Responses-only features such as previous_response_id,
+                conversation_id, prompt, or non-text-only tool outputs. Defaults to False, which
+                preserves the default compatibility behavior.
             openai_websocket_base_url: The websocket base URL to use for the OpenAI provider.
                 If not provided, the provider will use `OPENAI_WEBSOCKET_BASE_URL` when set.
             openai_prefix_mode: Controls how ``openai/...`` model strings are interpreted.
@@ -113,6 +124,13 @@ class MultiProvider(ModelProvider):
                 behavior and raises ``UserError``. ``"model_id"`` passes the full string through to
                 the OpenAI provider so OpenAI-compatible endpoints can receive namespaced model IDs
                 such as ``openrouter/openai/gpt-4o``.
+            openai_agent_registration: Optional agent registration configuration for the OpenAI
+                provider.
+            openai_responses_websocket_options: Optional low-level websocket keepalive options for
+                the OpenAI Responses websocket transport.
+            openai_buffer_streamed_tool_calls: Whether OpenAI Chat Completions models should buffer
+                streamed function tool-call deltas and emit them to the SDK only after the provider
+                stream finishes.
         """
         self.provider_map = provider_map
         self.openai_provider = OpenAIProvider(
@@ -124,6 +142,10 @@ class MultiProvider(ModelProvider):
             project=openai_project,
             use_responses=openai_use_responses,
             use_responses_websocket=openai_use_responses_websocket,
+            strict_feature_validation=openai_strict_feature_validation,
+            agent_registration=openai_agent_registration,
+            responses_websocket_options=openai_responses_websocket_options,
+            buffer_streamed_tool_calls=openai_buffer_streamed_tool_calls,
         )
         self._openai_prefix_mode = self._validate_openai_prefix_mode(openai_prefix_mode)
         self._unknown_prefix_mode = self._validate_unknown_prefix_mode(unknown_prefix_mode)
@@ -183,7 +205,10 @@ class MultiProvider(ModelProvider):
     ) -> tuple[ModelProvider, str | None]:
         # Explicit provider_map entries are the least surprising routing mechanism, so they always
         # win over the built-in OpenAI alias and unknown-prefix fallback behavior.
-        if self.provider_map and (provider := self.provider_map.get_provider(prefix)):
+        if (
+            self.provider_map is not None
+            and (provider := self.provider_map.get_provider(prefix)) is not None
+        ):
             return provider, stripped_model_name
 
         if prefix in {"litellm", "any-llm"}:
@@ -234,6 +259,7 @@ class MultiProvider(ModelProvider):
         providers.extend(self._fallback_providers.values())
 
         seen: set[int] = set()
+        first_error: Exception | None = None
         for provider in providers:
             if provider is self:
                 continue
@@ -241,4 +267,13 @@ class MultiProvider(ModelProvider):
             if provider_id in seen:
                 continue
             seen.add(provider_id)
-            await provider.aclose()
+            try:
+                await provider.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+
+        if first_error is not None:
+            raise first_error

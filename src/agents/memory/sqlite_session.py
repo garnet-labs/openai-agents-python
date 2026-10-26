@@ -4,14 +4,15 @@ import asyncio
 import json
 import sqlite3
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+import time
+from collections.abc import Callable, Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from ..items import TResponseInputItem
-from .session import SessionABC
-from .session_settings import SessionSettings, resolve_session_limit
+from .session import SessionABC, _await_mutation as _await_mutation, _CompactionSnapshot
+from .session_settings import SessionSettings, coerce_session_settings, resolve_session_limit
 
 
 class SQLiteSession(SessionABC):
@@ -33,7 +34,7 @@ class SQLiteSession(SessionABC):
         db_path: str | Path = ":memory:",
         sessions_table: str = "agent_sessions",
         messages_table: str = "agent_messages",
-        session_settings: SessionSettings | None = None,
+        session_settings: SessionSettings | dict[str, Any] | None = None,
     ):
         """Initialize the SQLite session.
 
@@ -47,11 +48,20 @@ class SQLiteSession(SessionABC):
                 retrieving items. If None, uses default SessionSettings().
         """
         self.session_id = session_id
-        self.session_settings = session_settings or SessionSettings()
+        self.session_settings = (
+            coerce_session_settings(session_settings)
+            if session_settings is not None
+            else SessionSettings()
+        )
         self.db_path = db_path
         self.sessions_table = sessions_table
         self.messages_table = messages_table
         self._local = threading.local()
+        self._connections: set[sqlite3.Connection] = set()
+        self._connection_owners: dict[sqlite3.Connection, threading.Thread] = {}
+        self._quarantined_connections: set[sqlite3.Connection] = set()
+        self._connections_lock = threading.Lock()
+        self._closed = False
 
         # For in-memory databases, we need a shared connection to avoid thread isolation
         # For file databases, we use thread-local connections for better concurrency
@@ -66,15 +76,16 @@ class SQLiteSession(SessionABC):
         try:
             if self._is_memory_db:
                 self._shared_connection = sqlite3.connect(":memory:", check_same_thread=False)
-                self._shared_connection.execute("PRAGMA journal_mode=WAL")
+                self._configure_connection(self._shared_connection)
                 self._init_db_for_connection(self._shared_connection)
             else:
                 # For file databases, initialize the schema once since it persists
                 with self._lock:
-                    init_conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-                    init_conn.execute("PRAGMA journal_mode=WAL")
-                    self._init_db_for_connection(init_conn)
-                    init_conn.close()
+                    with closing(
+                        sqlite3.connect(str(self.db_path), check_same_thread=False)
+                    ) as init_conn:
+                        self._configure_connection(init_conn)
+                        self._init_db_for_connection(init_conn)
         except Exception:
             if self._lock_path is not None and not self._lock_released:
                 self._release_file_lock(self._lock_path)
@@ -113,26 +124,110 @@ class SQLiteSession(SessionABC):
         with self._lock:
             yield self._get_connection()
 
+    def _check_not_closed(self) -> None:
+        """Raise if the session has already been closed."""
+        if self._closed:
+            raise RuntimeError("SQLiteSession is closed")
+
+    @contextmanager
+    def _write_connection(self) -> Iterator[sqlite3.Connection]:
+        """Provide a connection that cannot retain a failed write transaction."""
+        with self._locked_connection() as conn:
+            try:
+                yield conn
+            except BaseException:
+                try:
+                    conn.rollback()
+                except BaseException:
+                    self._invalidate_connection(conn)
+                raise
+
+    def _invalidate_connection(self, conn: sqlite3.Connection) -> None:
+        """Close and evict a connection that could not roll back safely."""
+        try:
+            conn.close()
+        except BaseException:
+            close_failed = True
+        else:
+            close_failed = False
+
+        with self._connections_lock:
+            self._connections.discard(conn)
+            self._connection_owners.pop(conn, None)
+            if close_failed:
+                self._quarantined_connections.add(conn)
+            else:
+                self._quarantined_connections.discard(conn)
+        if getattr(self._local, "connection", None) is conn:
+            del self._local.connection
+        if self._is_memory_db or close_failed:
+            self._closed = True
+
     def _get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
+        self._check_not_closed()
+
         if self._is_memory_db:
             # Use shared connection for in-memory database to avoid thread isolation
             return self._shared_connection
         else:
             # Use thread-local connections for file databases
             if not hasattr(self._local, "connection"):
-                self._local.connection = sqlite3.connect(
+                # Release retired workers' connections before opening the replacement, so a
+                # burst of exits cannot exhaust the descriptors this allocation needs.
+                with self._connections_lock:
+                    self._close_connections_from_exited_threads()
+                connection = sqlite3.connect(
                     str(self.db_path),
                     check_same_thread=False,
                 )
-                self._local.connection.execute("PRAGMA journal_mode=WAL")
+                self._configure_connection(connection)
+                self._local.connection = connection
+                with self._connections_lock:
+                    self._connections.add(connection)
+                    self._connection_owners[connection] = threading.current_thread()
             assert isinstance(self._local.connection, sqlite3.Connection), (
                 f"Expected sqlite3.Connection, got {type(self._local.connection)}"
             )
             return self._local.connection
 
+    def _close_connections_from_exited_threads(self) -> None:
+        """Close tracked connections whose owning worker thread has exited."""
+        # Callers hold _connections_lock. A worker's thread-local connection is
+        # unreachable once its thread is gone, so this registry is the only reference.
+        for conn, owner in list(self._connection_owners.items()):
+            if owner.is_alive():
+                continue
+            try:
+                conn.close()
+            except Exception:
+                self._quarantined_connections.add(conn)
+            # Evicted after the close, so an interrupt cannot drop an open connection.
+            del self._connection_owners[conn]
+            self._connections.discard(conn)
+
+    @staticmethod
+    def _configure_connection(conn: sqlite3.Connection) -> None:
+        """Enable WAL, retrying its transient cross-process initialization lock."""
+        timeout_row = conn.execute("PRAGMA busy_timeout").fetchone()
+        timeout_seconds = (timeout_row[0] if timeout_row is not None else 0) / 1000
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+
     def _init_db_for_connection(self, conn: sqlite3.Connection) -> None:
         """Initialize the database schema for a specific connection."""
+        self._create_schema_for_connection(conn)
+        conn.commit()
+
+    def _create_schema_for_connection(self, conn: sqlite3.Connection) -> None:
+        """Create the database schema without committing the current transaction."""
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self.sessions_table} (
@@ -162,8 +257,6 @@ class SQLiteSession(SessionABC):
             ON {self.messages_table} (session_id, id)
         """
         )
-
-        conn.commit()
 
     def _insert_items(self, conn: sqlite3.Connection, items: list[TResponseInputItem]) -> None:
         conn.execute(
@@ -202,6 +295,17 @@ class SQLiteSession(SessionABC):
         """
         session_limit = resolve_session_limit(limit, self.session_settings)
 
+        def _decode_rows(rows: list[Any]) -> list[TResponseInputItem]:
+            items: list[TResponseInputItem] = []
+            for (message_data,) in rows:
+                try:
+                    item = json.loads(message_data)
+                    items.append(item)
+                except (json.JSONDecodeError, TypeError):
+                    # Skip invalid JSON entries
+                    continue
+            return items
+
         def _get_items_sync():
             with self._locked_connection() as conn:
                 if session_limit is None:
@@ -214,36 +318,131 @@ class SQLiteSession(SessionABC):
                     """,
                         (self.session_id,),
                     )
-                else:
-                    # Fetch the latest N items in chronological order
-                    cursor = conn.execute(
-                        f"""
-                        SELECT message_data FROM {self.messages_table}
-                        WHERE session_id = ?
-                        ORDER BY id DESC
-                        LIMIT ?
-                        """,
-                        (self.session_id, session_limit),
-                    )
+                    return _decode_rows(cursor.fetchall())
 
-                rows = cursor.fetchall()
+                if session_limit > 0:
+                    # Expand the fetch window when corrupt rows sit among the newest entries so
+                    # limit counts valid conversation items, matching EncryptedSession and pop_item.
+                    window = session_limit
+                    while True:
+                        cursor = conn.execute(
+                            f"""
+                            SELECT message_data FROM {self.messages_table}
+                            WHERE session_id = ?
+                            ORDER BY id DESC
+                            LIMIT ?
+                            """,
+                            (self.session_id, window),
+                        )
+                        rows = cursor.fetchall()
+                        items = _decode_rows(list(reversed(rows)))
+                        if len(items) >= session_limit:
+                            return items[-session_limit:]
+                        if len(rows) < window:
+                            return items
+                        window *= 2
 
-                # Reverse to get chronological order when using DESC
-                if session_limit is not None:
-                    rows = list(reversed(rows))
-
-                items = []
-                for (message_data,) in rows:
-                    try:
-                        item = json.loads(message_data)
-                        items.append(item)
-                    except json.JSONDecodeError:
-                        # Skip invalid JSON entries
-                        continue
-
-                return items
+                # Preserve historical non-positive LIMIT semantics (including SQLite's
+                # unlimited behavior for negative values).
+                cursor = conn.execute(
+                    f"""
+                    SELECT message_data FROM {self.messages_table}
+                    WHERE session_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (self.session_id, session_limit),
+                )
+                return _decode_rows(list(reversed(cursor.fetchall())))
 
         return await asyncio.to_thread(_get_items_sync)
+
+    async def _get_compaction_snapshot(
+        self,
+        limit: int,
+        *,
+        prune_prefix: Callable[[TResponseInputItem], bool] | None = None,
+    ) -> _CompactionSnapshot | None:
+        # Subclasses may maintain extra indexes or transform get/add items. They must
+        # supply their own snapshot operation rather than inherit a bypass of those hooks.
+        if type(self) is not SQLiteSession:
+            return None
+
+        def read_rows():
+            with self._locked_connection() as conn:
+                rows = conn.execute(
+                    f"SELECT id, message_data FROM {self.messages_table} "
+                    "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    (self.session_id, limit),
+                ).fetchall()[::-1]
+                complete = (
+                    len(rows) < limit
+                    or not conn.execute(
+                        f"SELECT 1 FROM {self.messages_table} "
+                        "WHERE session_id = ? AND id < ? LIMIT 1",
+                        (self.session_id, rows[0][0]),
+                    ).fetchone()
+                )
+                return rows, complete
+
+        rows, complete = await asyncio.to_thread(read_rows)
+        try:
+            items = [json.loads(data) for _, data in rows]
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        async def replace_suffix(start: int, output: list[TResponseInputItem]) -> bool:
+            expected = rows[start:]
+            if not expected:
+                return False
+
+            def replace_sync() -> bool:
+                with self._write_connection() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    current = conn.execute(
+                        f"SELECT id, message_data FROM {self.messages_table} "
+                        "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                        (self.session_id, len(expected)),
+                    ).fetchall()[::-1]
+                    if current != expected:
+                        conn.rollback()
+                        return False
+                    if prune_prefix is not None:
+                        while True:
+                            prefix = conn.execute(
+                                f"SELECT id, message_data FROM {self.messages_table} "
+                                "WHERE session_id = ? AND id < ? ORDER BY id LIMIT ?",
+                                (self.session_id, expected[0][0], limit),
+                            ).fetchall()
+                            expired_end = None
+                            for row_id, data in prefix:
+                                try:
+                                    item = json.loads(data)
+                                except (json.JSONDecodeError, TypeError):
+                                    break
+                                if not prune_prefix(item):
+                                    break
+                                expired_end = row_id
+                            if expired_end is None:
+                                break
+                            conn.execute(
+                                f"DELETE FROM {self.messages_table} "
+                                "WHERE session_id = ? AND id <= ?",
+                                (self.session_id, expired_end),
+                            )
+                            if expired_end != prefix[-1][0] or len(prefix) < limit:
+                                break
+                    conn.execute(
+                        f"DELETE FROM {self.messages_table} WHERE session_id = ? AND id >= ?",
+                        (self.session_id, expected[0][0]),
+                    )
+                    self._insert_items(conn, output)
+                    conn.commit()
+                    return True
+
+            return await _await_mutation(asyncio.to_thread(replace_sync))
+
+        return _CompactionSnapshot(items, complete, replace_suffix)
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         """Add new items to the conversation history.
@@ -251,15 +450,18 @@ class SQLiteSession(SessionABC):
         Args:
             items: List of input items to add to the history
         """
+        # Checked before the empty-list fast path, which would otherwise return
+        # successfully on a closed session.
+        self._check_not_closed()
         if not items:
             return
 
         def _add_items_sync():
-            with self._locked_connection() as conn:
+            with self._write_connection() as conn:
                 self._insert_items(conn, items)
                 conn.commit()
 
-        await asyncio.to_thread(_add_items_sync)
+        await _await_mutation(asyncio.to_thread(_add_items_sync))
 
     async def pop_item(self) -> TResponseInputItem | None:
         """Remove and return the most recent item from the session.
@@ -267,45 +469,60 @@ class SQLiteSession(SessionABC):
         Returns:
             The most recent item if it exists, None if the session is empty
         """
+        return await self._pop_item_with_validation()
+
+    async def _pop_item_with_validation(
+        self, validate: Callable[[TResponseInputItem], None] | None = None
+    ) -> TResponseInputItem | None:
+        """Validate the claimed item before committing its removal.
+
+        A validation exception rolls back the deletion, preserving the row's ID
+        and position. The callback runs synchronously in the SQLite worker thread.
+        """
 
         def _pop_item_sync():
-            with self._locked_connection() as conn:
-                # Use DELETE with RETURNING to atomically delete and return the most recent item
-                cursor = conn.execute(
-                    f"""
-                    DELETE FROM {self.messages_table}
-                    WHERE id = (
-                        SELECT id FROM {self.messages_table}
-                        WHERE session_id = ?
-                        ORDER BY id DESC
-                        LIMIT 1
-                    )
-                    RETURNING message_data
-                    """,
-                    (self.session_id,),
-                )
+            with self._write_connection() as conn:
+                while True:
+                    # Claim the tail inside the transaction that owns validation.
+                    with closing(
+                        conn.execute(
+                            f"""
+                            DELETE FROM {self.messages_table}
+                            WHERE id = (
+                                SELECT id FROM {self.messages_table}
+                                WHERE session_id = ?
+                                ORDER BY id DESC
+                                LIMIT 1
+                            )
+                            RETURNING message_data
+                            """,
+                            (self.session_id,),
+                        )
+                    ) as cursor:
+                        result = cursor.fetchone()
 
-                result = cursor.fetchone()
-                conn.commit()
-
-                if result:
-                    message_data = result[0]
-                    try:
-                        item = json.loads(message_data)
-                        return item
-                    except json.JSONDecodeError:
-                        # Return None for corrupted JSON entries (already deleted)
+                    if result is None:
+                        conn.commit()
                         return None
 
-                return None
+                    try:
+                        item = json.loads(result[0])
+                    except (json.JSONDecodeError, TypeError):
+                        # Drop corrupted JSON entries and keep looking for a valid item.
+                        conn.commit()
+                        continue
+                    if validate is not None:
+                        validate(item)
+                    conn.commit()
+                    return item
 
-        return await asyncio.to_thread(_pop_item_sync)
+        return await _await_mutation(asyncio.to_thread(_pop_item_sync))
 
     async def clear_session(self) -> None:
         """Clear all items for this session."""
 
         def _clear_session_sync():
-            with self._locked_connection() as conn:
+            with self._write_connection() as conn:
                 conn.execute(
                     f"DELETE FROM {self.messages_table} WHERE session_id = ?",
                     (self.session_id,),
@@ -316,16 +533,45 @@ class SQLiteSession(SessionABC):
                 )
                 conn.commit()
 
-        await asyncio.to_thread(_clear_session_sync)
+        await _await_mutation(asyncio.to_thread(_clear_session_sync))
 
     def close(self) -> None:
         """Close the database connection."""
-        if self._is_memory_db:
-            if hasattr(self, "_shared_connection"):
-                self._shared_connection.close()
-        else:
-            if hasattr(self._local, "connection"):
-                self._local.connection.close()
-            if self._lock_path is not None and not self._lock_released:
-                self._release_file_lock(self._lock_path)
-                self._lock_released = True
+        with self._lock:
+            self._closed = True
+            with self._connections_lock:
+                connections = self._connections | self._quarantined_connections
+            if self._is_memory_db:
+                if hasattr(self, "_shared_connection"):
+                    connections.add(self._shared_connection)
+
+            first_error: BaseException | None = None
+            for connection in connections:
+                try:
+                    connection.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    with self._connections_lock:
+                        self._connections.discard(connection)
+                        self._quarantined_connections.add(connection)
+                else:
+                    with self._connections_lock:
+                        self._connections.discard(connection)
+                        self._quarantined_connections.discard(connection)
+
+            if getattr(self._local, "connection", None) in connections:
+                del self._local.connection
+
+            with self._connections_lock:
+                self._connection_owners.clear()
+                has_unclosed_connections = bool(self._quarantined_connections)
+            if not has_unclosed_connections and self._lock_path is not None:
+                with self._connections_lock:
+                    self._connections.clear()
+                if not self._lock_released:
+                    self._release_file_lock(self._lock_path)
+                    self._lock_released = True
+
+            if first_error is not None:
+                raise first_error

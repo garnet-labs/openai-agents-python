@@ -3,31 +3,42 @@ from __future__ import annotations
 import asyncio
 import os
 import weakref
+from typing import Any
 
-import httpx
-from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+import httpx2
+from openai import AsyncOpenAI, DefaultAsyncHttpx2Client
 
+from ..exceptions import UserError
 from . import _openai_shared
 from .default_models import get_default_model
 from .interface import Model, ModelProvider
+from .openai_agent_registration import (
+    OpenAIAgentRegistrationConfig,
+    ResolvedOpenAIAgentRegistrationConfig,
+    resolve_openai_agent_registration_config,
+)
 from .openai_chatcompletions import OpenAIChatCompletionsModel
-from .openai_responses import OpenAIResponsesModel, OpenAIResponsesWSModel
+from .openai_responses import (
+    OpenAIResponsesModel,
+    OpenAIResponsesWebSocketOptions,
+    OpenAIResponsesWSModel,
+)
 
 # This is kept for backward compatibility but using get_default_model() method is recommended.
 DEFAULT_MODEL: str = "gpt-4o"
 
 
-_http_client: httpx.AsyncClient | None = None
+_http_client: httpx2.AsyncClient | None = None
 _WSModelCacheKey = tuple[str, bool]
 _WSLoopModelCache = dict[_WSModelCacheKey, Model]
 
 
-# If we create a new httpx client for each request, that would mean no sharing of connection pools,
+# If we create a new HTTP client for each request, that would mean no sharing of connection pools,
 # which would mean worse latency and resource usage. So, we share the client across requests.
-def shared_http_client() -> httpx.AsyncClient:
+def shared_http_client() -> httpx2.AsyncClient:
     global _http_client
     if _http_client is None:
-        _http_client = DefaultAsyncHttpxClient()
+        _http_client = DefaultAsyncHttpx2Client()
     return _http_client
 
 
@@ -43,6 +54,10 @@ class OpenAIProvider(ModelProvider):
         project: str | None = None,
         use_responses: bool | None = None,
         use_responses_websocket: bool | None = None,
+        strict_feature_validation: bool = False,
+        agent_registration: OpenAIAgentRegistrationConfig | dict[str, Any] | None = None,
+        responses_websocket_options: OpenAIResponsesWebSocketOptions | None = None,
+        buffer_streamed_tool_calls: bool = False,
     ) -> None:
         """Create a new OpenAI provider.
 
@@ -60,12 +75,27 @@ class OpenAIProvider(ModelProvider):
             use_responses: Whether to use the OpenAI responses API.
             use_responses_websocket: Whether to use websocket transport for the OpenAI responses
                 API.
+            strict_feature_validation: Whether Chat Completions models should raise a UserError
+                when callers pass Responses-only features such as previous_response_id,
+                conversation_id, prompt, or non-text-only tool outputs. Defaults to False, which
+                preserves the default compatibility behavior.
+            agent_registration: Optional agent registration configuration.
+            responses_websocket_options: Optional low-level websocket keepalive options for the
+                OpenAI Responses websocket transport.
+            buffer_streamed_tool_calls: Whether Chat Completions models should buffer streamed
+                function tool-call deltas and emit them to the SDK only after the provider stream
+                finishes. This is useful for OpenAI-compatible providers whose streamed tool-call
+                chunk semantics are not reliable enough for incremental processing.
         """
         if openai_client is not None:
-            assert api_key is None and base_url is None and websocket_base_url is None, (
-                "Don't provide api_key, base_url, or websocket_base_url if you provide "
-                "openai_client"
-            )
+            if any(
+                value is not None
+                for value in (api_key, base_url, websocket_base_url, organization, project)
+            ):
+                raise UserError(
+                    "Don't provide api_key, base_url, websocket_base_url, organization, or project "
+                    "if you provide openai_client"
+                )
             self._client: AsyncOpenAI | None = openai_client
         else:
             self._client = None
@@ -88,26 +118,61 @@ class OpenAIProvider(ModelProvider):
             self._responses_transport = _openai_shared.get_default_openai_responses_transport()
         # Backward-compatibility shim for internal tests/diagnostics that inspect the legacy flag.
         self._use_responses_websocket = self._responses_transport == "websocket"
+        self._strict_feature_validation = strict_feature_validation
+        self._responses_websocket_options = responses_websocket_options
+        self._buffer_streamed_tool_calls = buffer_streamed_tool_calls
 
         # Reuse websocket model wrappers so websocket transport can keep a persistent connection
         # when callers pass model names as strings through a shared provider.
         self._ws_model_cache_by_loop: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, _WSLoopModelCache
         ] = weakref.WeakKeyDictionary()
+        self._agent_registration = resolve_openai_agent_registration_config(agent_registration)
+
+    @property
+    def agent_registration(self) -> ResolvedOpenAIAgentRegistrationConfig | None:
+        return self._agent_registration
 
     # We lazy load the client in case you never actually use OpenAIProvider(). Otherwise
     # AsyncOpenAI() raises an error if you don't have an API key set.
     def _get_client(self) -> AsyncOpenAI:
         if self._client is None:
-            self._client = _openai_shared.get_default_openai_client() or AsyncOpenAI(
-                api_key=self._stored_api_key or _openai_shared.get_default_openai_key(),
-                base_url=self._stored_base_url or os.getenv("OPENAI_BASE_URL"),
-                websocket_base_url=(
-                    self._stored_websocket_base_url or os.getenv("OPENAI_WEBSOCKET_BASE_URL")
-                ),
-                organization=self._stored_organization,
-                project=self._stored_project,
-                http_client=shared_http_client(),
+            has_explicit_client_options = any(
+                value is not None
+                for value in (
+                    self._stored_api_key,
+                    self._stored_base_url,
+                    self._stored_websocket_base_url,
+                    self._stored_organization,
+                    self._stored_project,
+                )
+            )
+            default_client = (
+                None if has_explicit_client_options else _openai_shared.get_default_openai_client()
+            )
+            self._client = (
+                default_client
+                if default_client is not None
+                else AsyncOpenAI(
+                    api_key=(
+                        self._stored_api_key
+                        if self._stored_api_key is not None
+                        else _openai_shared.get_default_openai_key()
+                    ),
+                    base_url=(
+                        self._stored_base_url
+                        if self._stored_base_url is not None
+                        else os.getenv("OPENAI_BASE_URL")
+                    ),
+                    websocket_base_url=(
+                        self._stored_websocket_base_url
+                        if self._stored_websocket_base_url is not None
+                        else os.getenv("OPENAI_WEBSOCKET_BASE_URL")
+                    ),
+                    organization=self._stored_organization,
+                    project=self._stored_project,
+                    http_client=shared_http_client(),
+                )
             )
 
         return self._client
@@ -200,19 +265,29 @@ class OpenAIProvider(ModelProvider):
         model: Model
 
         if not self._use_responses:
-            return OpenAIChatCompletionsModel(model=resolved_model_name, openai_client=client)
+            return OpenAIChatCompletionsModel(
+                model=resolved_model_name,
+                openai_client=client,
+                strict_feature_validation=self._strict_feature_validation,
+                buffer_streamed_tool_calls=self._buffer_streamed_tool_calls,
+            )
 
-        responses_model_type = (
-            OpenAIResponsesWSModel if use_websocket_transport else OpenAIResponsesModel
-        )
-        model = responses_model_type(
+        if use_websocket_transport:
+            model = OpenAIResponsesWSModel(
+                model=resolved_model_name,
+                openai_client=client,
+                model_is_explicit=model_is_explicit,
+                websocket_options=self._responses_websocket_options,
+            )
+            if loop_cache is not None:
+                loop_cache[cache_key] = model
+            return model
+
+        model = OpenAIResponsesModel(
             model=resolved_model_name,
             openai_client=client,
             model_is_explicit=model_is_explicit,
         )
-        if use_websocket_transport:
-            if loop_cache is not None:
-                loop_cache[cache_key] = model
         return model
 
     async def aclose(self) -> None:

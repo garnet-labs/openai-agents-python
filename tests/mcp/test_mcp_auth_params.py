@@ -8,6 +8,10 @@ import httpx
 import pytest
 
 from agents.mcp import MCPServerSse, MCPServerStreamableHttp
+from agents.mcp._compat import MCP_V2
+from agents.mcp.server import _create_default_streamable_http_client
+
+pytestmark = pytest.mark.skipif(MCP_V2, reason="These assertions cover the MCP v1 HTTP stack")
 
 
 class TestMCPServerSseAuthAndFactory:
@@ -15,7 +19,7 @@ class TestMCPServerSseAuthAndFactory:
 
     @pytest.mark.asyncio
     async def test_sse_default_no_auth_no_factory(self):
-        """SSE create_streams passes only the four base params when no extras are set."""
+        """SSE create_streams falls back to the hardened default httpx_client_factory."""
         with patch("agents.mcp.server.sse_client") as mock_client:
             mock_client.return_value = MagicMock()
             server = MCPServerSse(params={"url": "http://localhost:8000/sse"})
@@ -25,11 +29,12 @@ class TestMCPServerSseAuthAndFactory:
                 headers=None,
                 timeout=5,
                 sse_read_timeout=300,
+                httpx_client_factory=_create_default_streamable_http_client,
             )
 
     @pytest.mark.asyncio
     async def test_sse_with_auth(self):
-        """SSE create_streams forwards the auth parameter when provided."""
+        """SSE create_streams forwards auth and still applies the hardened default factory."""
         auth = httpx.BasicAuth(username="user", password="pass")
         with patch("agents.mcp.server.sse_client") as mock_client:
             mock_client.return_value = MagicMock()
@@ -41,6 +46,7 @@ class TestMCPServerSseAuthAndFactory:
                 timeout=5,
                 sse_read_timeout=300,
                 auth=auth,
+                httpx_client_factory=_create_default_streamable_http_client,
             )
 
     @pytest.mark.asyncio
@@ -120,6 +126,7 @@ class TestMCPServerStreamableHttpAuth:
                 timeout=5,
                 sse_read_timeout=300,
                 terminate_on_close=True,
+                httpx_client_factory=_create_default_streamable_http_client,
             )
 
     @pytest.mark.asyncio
@@ -138,6 +145,7 @@ class TestMCPServerStreamableHttpAuth:
                 timeout=5,
                 sse_read_timeout=300,
                 terminate_on_close=True,
+                httpx_client_factory=_create_default_streamable_http_client,
                 auth=auth,
             )
 

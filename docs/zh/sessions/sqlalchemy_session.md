@@ -4,19 +4,27 @@ search:
 ---
 # SQLAlchemy 会话
 
-`SQLAlchemySession` 使用 SQLAlchemy 提供可用于生产环境的会话实现，使你能够使用 SQLAlchemy 支持的任意数据库（PostgreSQL、MySQL、SQLite 等）进行会话存储。
+`SQLAlchemySession` 使用 SQLAlchemy 提供可用于生产环境的会话实现，支持使用 SQLAlchemy 兼容的任何数据库（PostgreSQL、MySQL、SQLite 等）存储会话。
 
-## 安装
+## 安装 {#installation}
 
-SQLAlchemy 会话需要 `sqlalchemy` 扩展：
+SQLAlchemy 会话需要 `sqlalchemy` 可选依赖 extra，以及与数据库 URL 匹配的异步数据库驱动程序。
+
+对于以下 SQLite 代码示例（`sqlite+aiosqlite://`），请在安装该 extra 的同时安装 `aiosqlite`：
 
 ```bash
-pip install openai-agents[sqlalchemy]
+pip install 'openai-agents[sqlalchemy]' aiosqlite
 ```
 
-## 快速开始
+该 extra 已包含 `asyncpg`，用于以 `postgresql+asyncpg://` 开头的 PostgreSQL URL。对于以 `mysql+aiomysql://` 开头的 MySQL URL，请在安装该 extra 的同时安装 `aiomysql`。该驱动程序的 `rsa` extra 提供 MySQL SHA-256 身份验证方法所需的依赖项：
 
-### 使用数据库 URL
+```bash
+pip install 'openai-agents[sqlalchemy]' 'aiomysql[rsa]'
+```
+
+## 快速开始 {#quick-start}
+
+### 数据库 URL 的使用 {#using-database-url}
 
 最简单的入门方式：
 
@@ -42,9 +50,9 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 使用现有引擎
+### 现有引擎的使用 {#using-existing-engine}
 
-适用于已有 SQLAlchemy 引擎的应用程序：
+对于已有 SQLAlchemy 引擎的应用程序：
 
 ```python
 import asyncio
@@ -73,7 +81,25 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## API 参考
+## 非 ASCII 文本的存储 {#storing-non-ascii-text}
+
+默认情况下，`SQLAlchemySession` 在将会话项目序列化为 JSON 时会转义非 ASCII 字符。这样既能保留原有的存储格式，也能在加载项目时还原原始文本。
+
+如果希望多语言文本在存储的 JSON 中保持可读，请设置 `ensure_ascii=False`：
+
+```python
+session = SQLAlchemySession.from_url(
+    "user-123",
+    url="sqlite+aiosqlite:///conversations.db",
+    create_tables=True,
+    ensure_ascii=False,
+)
+```
+
+使用现有引擎时，也可以将相同的选项直接传递给 `SQLAlchemySession(...)`。此设置只会更改数据库中存储的 JSON 表示形式，不会更改会话方法返回的值。
+
+
+## API 参考 {#api-reference}
 
 - [`SQLAlchemySession`][agents.extensions.memory.sqlalchemy_session.SQLAlchemySession] - 主类
 - [`Session`][agents.memory.session.Session] - 基础会话协议

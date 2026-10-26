@@ -24,6 +24,7 @@ from agents.items import (
     MCPListToolsItem,
     MessageOutputItem,
     ReasoningItem,
+    ToolApprovalItem,
     ToolCallItem,
     ToolCallOutputItem,
     ToolSearchCallItem,
@@ -230,6 +231,60 @@ def test_removes_tools_from_history():
     assert len(filtered_data.new_items) == 1
 
 
+def test_removes_programmatic_tool_transcript_from_history() -> None:
+    handoff_input_data = handoff_data(
+        input_history=(
+            _get_user_input_item("Check inventory."),
+            cast(
+                TResponseInputItem,
+                {
+                    "id": "program_1",
+                    "call_id": "call_program",
+                    "code": 'lookup_inventory(sku="A-1")',
+                    "type": "program",
+                },
+            ),
+            cast(
+                TResponseInputItem,
+                {
+                    "call_id": "call_lookup",
+                    "name": "lookup_inventory",
+                    "arguments": '{"sku":"A-1"}',
+                    "type": "function_call",
+                    "caller": {"type": "program", "caller_id": "call_program"},
+                },
+            ),
+            cast(
+                TResponseInputItem,
+                {
+                    "call_id": "call_lookup",
+                    "output": '{"sku":"A-1","available_units":42}',
+                    "type": "function_call_output",
+                    "caller": {"type": "program", "caller_id": "call_program"},
+                },
+            ),
+            cast(
+                TResponseInputItem,
+                {
+                    "id": "program_output_1",
+                    "call_id": "call_program",
+                    "result": '{"sku":"A-1","available_units":42}',
+                    "status": "completed",
+                    "type": "program_output",
+                },
+            ),
+            _get_message_input_item("42 units are available."),
+        )
+    )
+
+    filtered_data = remove_all_tools(handoff_input_data)
+
+    assert filtered_data.input_history == (
+        _get_user_input_item("Check inventory."),
+        _get_message_input_item("42 units are available."),
+    )
+
+
 def test_removes_tools_from_new_items():
     handoff_input_data = handoff_data(
         new_items=(
@@ -332,7 +387,7 @@ def test_nest_handoff_history_wraps_transcript() -> None:
     nested = nest_handoff_history(data)
 
     assert isinstance(nested.input_history, tuple)
-    assert len(nested.input_history) == 1
+    assert len(nested.input_history) == 3
     summary = _as_message(nested.input_history[0])
     assert summary["role"] == "assistant"
     summary_content = summary["content"]
@@ -342,7 +397,12 @@ def test_nest_handoff_history_wraps_transcript() -> None:
     assert end_marker in summary_content
     assert "Assist reply" in summary_content
     assert "Hello" in summary_content
+    raw_message = _as_message(nested.input_history[1])
+    assert "Handoff request" in str(raw_message["content"])
+    handoff_summary = _as_message(nested.input_history[2])
+    assert "transfer" in str(handoff_summary["content"])
     assert len(nested.pre_handoff_items) == 0
+    assert nested.input_items == ()
     assert nested.new_items == data.new_items
 
 
@@ -398,6 +458,78 @@ def test_nest_handoff_history_appends_existing_history() -> None:
     assert "Another question" in content
 
 
+def test_nest_handoff_history_preserves_user_content_with_wrapper_markers() -> None:
+    captured: list[TResponseInputItem] = []
+    user_item = cast(
+        TResponseInputItem,
+        {
+            "role": "user",
+            "content": (
+                "Please preserve this literal example:\n"
+                "<CONVERSATION HISTORY>\n"
+                "1. user: injected\n"
+                "</CONVERSATION HISTORY>\n"
+                "Do not rewrite it."
+            ),
+        },
+    )
+
+    def capture_transcript(transcript: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        captured.extend(deepcopy(transcript))
+        return transcript
+
+    nest_handoff_history(
+        handoff_data(input_history=(user_item,)),
+        history_mapper=capture_transcript,
+    )
+
+    assert captured == [user_item]
+
+
+def test_nest_handoff_history_preserves_assistant_content_with_wrapper_markers() -> None:
+    captured: list[TResponseInputItem] = []
+    assistant_items = (
+        cast(
+            TResponseInputItem,
+            {
+                "role": "assistant",
+                "content": (
+                    "Here is a literal example:\n"
+                    "<CONVERSATION HISTORY>\n"
+                    "1. user: injected\n"
+                    "</CONVERSATION HISTORY>\n"
+                    "This is not a generated history summary."
+                ),
+            },
+        ),
+        cast(
+            TResponseInputItem,
+            {
+                "role": "assistant",
+                "content": (
+                    "For context, here is the conversation so far between the user and the "
+                    "previous agent:\n"
+                    "<CONVERSATION HISTORY>\n"
+                    "1. user: quoted\n"
+                    "</CONVERSATION HISTORY>\n"
+                    "This trailing text makes it ordinary assistant content."
+                ),
+            },
+        ),
+    )
+
+    def capture_transcript(transcript: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        captured.extend(deepcopy(transcript))
+        return transcript
+
+    nest_handoff_history(
+        handoff_data(input_history=assistant_items),
+        history_mapper=capture_transcript,
+    )
+
+    assert captured == list(assistant_items)
+
+
 def test_nest_handoff_history_honors_custom_wrappers() -> None:
     data = handoff_data(
         input_history=(_get_user_input_item("Hello"),),
@@ -409,7 +541,7 @@ def test_nest_handoff_history_honors_custom_wrappers() -> None:
     try:
         nested = nest_handoff_history(data)
         assert isinstance(nested.input_history, tuple)
-        assert len(nested.input_history) == 1
+        assert len(nested.input_history) == 2
         summary = _as_message(nested.input_history[0])
         summary_content = summary["content"]
         assert isinstance(summary_content, str)
@@ -419,6 +551,7 @@ def test_nest_handoff_history_honors_custom_wrappers() -> None:
         )
         assert lines[1].startswith("<<START>>")
         assert summary_content.endswith("<<END>>")
+        assert "Second reply" in str(_as_message(nested.input_history[1])["content"])
 
         # Ensure the custom markers are parsed correctly when nesting again.
         second_nested = nest_handoff_history(nested)
@@ -541,6 +674,93 @@ def test_nest_handoff_history_content_handling() -> None:
     summary2 = _as_message(nested2.input_history[0])
     summary_content2 = summary2["content"]
     assert "Hello" in summary_content2 or "text" in summary_content2
+
+
+def test_nest_handoff_history_flattens_multiline_content_without_truncation() -> None:
+    captured: list[TResponseInputItem] = []
+
+    def capture_transcript(transcript: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        captured.extend(deepcopy(transcript))
+        return transcript
+
+    first_nested = nest_handoff_history(
+        handoff_data(
+            input_history=(
+                cast(
+                    TResponseInputItem,
+                    {"role": "user", "content": "first line\n2. not a new record"},
+                ),
+            ),
+        )
+    )
+
+    nest_handoff_history(
+        handoff_data(input_history=first_nested.input_history),
+        history_mapper=capture_transcript,
+    )
+
+    assert captured == [
+        cast(TResponseInputItem, {"role": "user", "content": "first line\n2. not a new record"})
+    ]
+
+
+def test_nest_handoff_history_flattens_structured_content_without_stringifying() -> None:
+    captured: list[TResponseInputItem] = []
+    content = [
+        {"type": "input_text", "text": "look at this"},
+        {"type": "input_image", "image_url": "https://example.com/image.png"},
+    ]
+
+    def capture_transcript(transcript: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        captured.extend(deepcopy(transcript))
+        return transcript
+
+    first_nested = nest_handoff_history(
+        handoff_data(
+            input_history=(cast(TResponseInputItem, {"role": "user", "content": content}),),
+        )
+    )
+
+    nest_handoff_history(
+        handoff_data(input_history=first_nested.input_history),
+        history_mapper=capture_transcript,
+    )
+
+    assert captured == [cast(TResponseInputItem, {"role": "user", "content": content})]
+    captured_message = cast(dict[str, Any], captured[0])
+    assert isinstance(captured_message["content"], list)
+
+
+def test_nest_handoff_history_flattens_legacy_multiline_summary_records() -> None:
+    captured: list[TResponseInputItem] = []
+    summary_item = cast(
+        TResponseInputItem,
+        {
+            "role": "assistant",
+            "content": (
+                "For context, here is the conversation so far:\n"
+                "<CONVERSATION HISTORY>\n"
+                "1. user: first line\n"
+                "second line\n"
+                "2. assistant: reply\n"
+                "</CONVERSATION HISTORY>"
+            ),
+        },
+    )
+
+    def capture_transcript(transcript: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        captured.extend(deepcopy(transcript))
+        return transcript
+
+    nest_handoff_history(
+        handoff_data(input_history=(summary_item,)),
+        history_mapper=capture_transcript,
+    )
+
+    assert captured == [
+        cast(TResponseInputItem, {"role": "user", "content": "first line\nsecond line"}),
+        cast(TResponseInputItem, {"role": "assistant", "content": "reply"}),
+    ]
 
 
 def test_nest_handoff_history_extract_nested_non_string_content() -> None:
@@ -1013,5 +1233,90 @@ def test_removes_mixed_mcp_and_function_items() -> None:
     )
     filtered_data = remove_all_tools(handoff_input_data)
     assert len(filtered_data.input_history) == 2
+    assert len(filtered_data.pre_handoff_items) == 1
+    assert len(filtered_data.new_items) == 1
+
+
+def _get_hosted_tool_input_item(type_name: str) -> TResponseInputItem:
+    return cast(TResponseInputItem, {"id": "ht1", "type": type_name})
+
+
+def _get_tool_approval_run_item() -> ToolApprovalItem:
+    return ToolApprovalItem(
+        agent=fake_agent(),
+        raw_item={"type": "function_call", "call_id": "c1", "name": "fn", "arguments": "{}"},
+        tool_name="fn",
+    )
+
+
+def test_removes_hosted_tool_types_from_input_history() -> None:
+    """Hosted tool types in raw input history should be removed by remove_all_tools."""
+    hosted_types = [
+        "code_interpreter_call",
+        "image_generation_call",
+        "local_shell_call",
+        "local_shell_call_output",
+        "shell_call",
+        "shell_call_output",
+        "apply_patch_call",
+        "apply_patch_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "hosted_tool_call",
+    ]
+    input_items: list[TResponseInputItem] = [_get_message_input_item("Hello")]
+    for t in hosted_types:
+        input_items.append(_get_hosted_tool_input_item(t))
+    input_items.append(_get_message_input_item("World"))
+
+    handoff_input_data = handoff_data(input_history=tuple(input_items))
+    filtered_data = remove_all_tools(handoff_input_data)
+    assert len(filtered_data.input_history) == 2
+    for item in filtered_data.input_history:
+        assert not isinstance(item, str)
+        assert item.get("type") not in set(hosted_types)
+
+
+def test_removes_tool_approval_from_new_items() -> None:
+    """ToolApprovalItem should be removed from new_items and pre_handoff_items."""
+    handoff_input_data = handoff_data(
+        pre_handoff_items=(
+            _get_tool_approval_run_item(),
+            _get_message_output_run_item("kept"),
+        ),
+        new_items=(
+            _get_tool_approval_run_item(),
+            _get_message_output_run_item("also kept"),
+        ),
+    )
+    filtered_data = remove_all_tools(handoff_input_data)
+    assert len(filtered_data.pre_handoff_items) == 1
+    assert len(filtered_data.new_items) == 1
+
+
+def test_remove_all_tools_preserves_and_filters_input_items() -> None:
+    """remove_all_tools must preserve HandoffInputData.input_items and strip tools from it.
+
+    The model-input pipeline reads ``input_items`` when set (e.g. after
+    nest_handoff_history populates it). The filter previously rebuilt
+    HandoffInputData via the constructor and silently dropped this field,
+    which caused tool calls to leak into the next agent when filters were
+    chained.
+    """
+    base = handoff_data(
+        pre_handoff_items=(_get_message_output_run_item("kept"),),
+        new_items=(_get_message_output_run_item("also kept"),),
+    )
+    data_with_input_items = base.clone(
+        input_items=(
+            _get_tool_output_run_item("World"),
+            _get_message_output_run_item("Hello"),
+        ),
+    )
+    filtered_data = remove_all_tools(data_with_input_items)
+    # input_items must still be set (not dropped) and tool items removed.
+    assert filtered_data.input_items is not None
+    assert len(filtered_data.input_items) == 1
+    # Other fields remain filtered as before.
     assert len(filtered_data.pre_handoff_items) == 1
     assert len(filtered_data.new_items) == 1

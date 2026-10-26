@@ -5,17 +5,26 @@ import contextlib
 import inspect
 import json
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeGuard, cast, get_args, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    TypedDict,
+    cast,
+    overload,
+)
 
-import httpx
+import httpx2
 from openai import AsyncOpenAI, NotGiven, Omit, omit
 from openai.types import ChatModel
 from openai.types.responses import (
     ApplyPatchToolParam,
+    CustomToolParam,
     FileSearchToolParam,
     FunctionToolParam,
     Response,
@@ -29,48 +38,73 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.responses.tool_param import LocalShell
+from typing_extensions import NotRequired
 
 from .. import _debug
+from .._httpx_compat import is_legacy_httpx_instance
 from .._tool_identity import (
     get_explicit_function_tool_namespace,
     get_function_tool_namespace_description,
 )
 from ..agent_output import AgentOutputSchemaBase
 from ..computer import AsyncComputer, Computer
-from ..exceptions import UserError
+from ..exceptions import ModelBehaviorError, UserError
 from ..handoffs import Handoff
 from ..items import ItemHelpers, ModelResponse, TResponseInputItem
-from ..logger import logger
+from ..logger import log_model_action_debug, log_model_action_error, logger
 from ..model_settings import MCPToolChoice
-from ..retry import ModelRetryAdvice, ModelRetryAdviceRequest
+from ..retry import ModelRetryAdvice, ModelRetryAdviceRequest, ModelRetryNormalizedError
 from ..tool import (
     ApplyPatchTool,
     CodeInterpreterTool,
     ComputerTool,
+    CustomTool,
     FileSearchTool,
     FunctionTool,
     HostedMCPTool,
     ImageGenerationTool,
     LocalShellTool,
+    ProgrammaticToolCallingTool,
     ShellTool,
     ShellToolEnvironment,
     Tool,
     ToolSearchTool,
     WebSearchTool,
     has_required_tool_search_surface,
+    validate_responses_programmatic_tool_calling_configuration,
     validate_responses_tool_search_configuration,
 )
 from ..tracing import SpanError, response_span
-from ..usage import Usage
+from ..usage import (
+    Usage,
+    _attach_raw_usage_snapshot,
+    _mark_request_completed_without_usage,
+    _raw_usage_snapshot,
+    _requests_for_response_without_usage,
+    _response_usage_to_usage,
+    model_usage_to_span_usage,
+)
+from ..util._error_tracing import (
+    record_current_task_model_timeout_on_span,
+    record_model_error_on_span,
+)
 from ..util._json import _to_dump_compatible
 from ..version import __version__
 from ._openai_retry import get_openai_retry_advice
+from ._openai_websocket import (
+    get_openai_websocket_logger,
+    merge_openai_client_websocket_headers,
+    prepare_openai_client_websocket_base_url,
+    refresh_openai_client_api_key_if_supported,
+)
+from ._response_terminal import response_error_event_failure_error, response_terminal_failure_error
 from ._retry_runtime import (
     should_disable_provider_managed_retries,
     should_disable_websocket_pre_event_retries,
 )
 from .fake_id import FAKE_RESPONSES_ID
 from .interface import Model, ModelTracing
+from .openai_client_utils import is_official_openai_base_url, is_official_openai_client
 
 if TYPE_CHECKING:
     from ..model_settings import ModelSettings
@@ -82,9 +116,6 @@ _HEADERS = {"User-Agent": _USER_AGENT}
 # Override headers used by the Responses API.
 _HEADERS_OVERRIDE: ContextVar[dict[str, str] | None] = ContextVar(
     "openai_responses_headers_override", default=None
-)
-_RESPONSE_INCLUDABLE_VALUES = frozenset(
-    value for value in get_args(ResponseIncludable) if isinstance(value, str)
 )
 
 
@@ -113,7 +144,7 @@ def _json_dumps_default(value: Any) -> Any:
 
 
 def _is_openai_omitted_value(value: Any) -> bool:
-    return isinstance(value, (Omit, NotGiven))
+    return isinstance(value, Omit | NotGiven)
 
 
 def _require_responses_tool_param(value: object) -> ResponsesToolParam:
@@ -125,10 +156,6 @@ def _require_responses_tool_param(value: object) -> ResponsesToolParam:
         raise TypeError(f"Invalid Responses tool param payload: {value!r}")
 
     return cast(ResponsesToolParam, value)
-
-
-def _is_response_includable(value: object) -> TypeGuard[ResponseIncludable]:
-    return isinstance(value, str) and value in _RESPONSE_INCLUDABLE_VALUES
 
 
 def _coerce_response_includables(values: Sequence[str]) -> list[ResponseIncludable]:
@@ -156,10 +183,8 @@ def _materialize_responses_tool_params(
 
 
 async def _refresh_openai_client_api_key_if_supported(client: Any) -> None:
-    """Refresh client auth if the current OpenAI SDK exposes a refresh hook."""
-    refresh_api_key = getattr(client, "_refresh_api_key", None)
-    if callable(refresh_api_key):
-        await refresh_api_key()
+    """Backward-compatible wrapper around shared WebSocket client credential refresh."""
+    await refresh_openai_client_api_key_if_supported(client)
 
 
 def _construct_response_stream_event_from_payload(
@@ -188,30 +213,75 @@ class _WebsocketRequestTimeouts:
     recv: float | None
 
 
+class OpenAIResponsesWebSocketOptions(TypedDict):
+    """Low-level OpenAI Responses websocket connection options."""
+
+    ping_interval: NotRequired[float | None]
+    """Time in seconds between keepalive pings sent by the client.
+
+    The underlying ``websockets`` library usually defaults to 20.0. Set to ``None`` to
+    disable keepalive pings.
+    """
+
+    ping_timeout: NotRequired[float | None]
+    """Time in seconds to wait for a pong response before disconnecting.
+
+    Set to ``None`` to keep pings enabled but disable heartbeat timeouts during large latency
+    spikes.
+    """
+
+    max_size: NotRequired[int | None]
+    """Maximum size in bytes of an incoming websocket message.
+
+    The SDK defaults to ``None`` (no limit). Set an explicit byte limit to bound memory usage
+    for long-lived agent processes running behind proxies or in memory-constrained containers.
+    """
+
+
+def _mark_transport_request_without_usage(response: object) -> None:
+    """Mark one adapter-owned request when its completed response omits usage."""
+    if isinstance(response, Response) and response.usage is None:
+        _mark_request_completed_without_usage(response)
+
+
+def _usage_from_response(response: Response) -> Usage:
+    """Convert provider usage while preserving an adapter-owned request marker."""
+    if response.usage is not None:
+        return _response_usage_to_usage(response.usage)
+    return Usage(requests=_requests_for_response_without_usage(response))
+
+
+async def _no_stream_cleanup() -> None:
+    """Provide a no-op cleanup callback for an externally owned stream."""
+
+
 class _ResponseStreamWithRequestId:
     """Wrap an SDK event stream and retain the originating request ID."""
 
-    _TERMINAL_EVENT_TYPES = {
+    _TERMINAL_EVENT_TYPES: ClassVar[set[str]] = {
         "response.completed",
         "response.failed",
         "response.incomplete",
+        "error",
         "response.error",
     }
 
     def __init__(
         self,
-        stream: AsyncIterator[ResponseStreamEvent],
+        stream: AsyncIterator[ResponseStreamEvent] | AsyncIterable[ResponseStreamEvent],
         *,
         request_id: str | None,
         cleanup: Callable[[], Awaitable[object]],
     ) -> None:
-        self._stream = stream
+        self._source = stream
+        self._stream: AsyncIterator[ResponseStreamEvent] | None = None
         self.request_id = request_id
         self._cleanup = cleanup
         self._closed = False
         self._stream_close_complete = False
         self._cleanup_complete = False
         self._yielded_terminal_event = False
+        self._close_task: asyncio.Future[None] | None = None
 
     def __aiter__(self) -> _ResponseStreamWithRequestId:
         return self
@@ -220,8 +290,13 @@ class _ResponseStreamWithRequestId:
         if self._closed:
             raise StopAsyncIteration
 
+        stream = self._stream
+        if stream is None:
+            stream = self._source.__aiter__()
+            self._stream = stream
+
         try:
-            event = await self._stream.__anext__()
+            event = await stream.__anext__()
         except StopAsyncIteration:
             self._closed = True
             await self._cleanup_after_exhaustion()
@@ -231,14 +306,13 @@ class _ResponseStreamWithRequestId:
         event_type = getattr(event, "type", None)
         if event_type in self._TERMINAL_EVENT_TYPES:
             self._yielded_terminal_event = True
+        if event_type == "response.completed":
+            _mark_transport_request_without_usage(getattr(event, "response", None))
         return event
 
     async def aclose(self) -> None:
         self._closed = True
-        try:
-            await self._close_stream_once()
-        finally:
-            await self._cleanup_once()
+        await self._close_stream_and_cleanup()
 
     async def close(self) -> None:
         await self.aclose()
@@ -264,24 +338,63 @@ class _ResponseStreamWithRequestId:
 
     async def _cleanup_after_exhaustion(self) -> None:
         try:
-            await self._cleanup_once()
+            await self._close_stream_and_cleanup()
         except Exception as exc:
             if self._yielded_terminal_event:
-                logger.debug(f"Ignoring stream cleanup error after terminal event: {exc}")
+                log_model_action_debug(
+                    logger, "Ignoring stream cleanup error after terminal event", exc
+                )
                 return
             raise
+
+    async def _close_stream_and_cleanup(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.ensure_future(self._finish_stream_close_and_cleanup())
+        await asyncio.shield(self._close_task)
+
+    async def _finish_stream_close_and_cleanup(self) -> None:
+        try:
+            await self._close_stream_once()
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                await self._cleanup_once()
+            raise
+        await self._cleanup_once()
 
     async def _close_stream_once(self) -> None:
         if self._stream_close_complete:
             return
         self._stream_close_complete = True
 
-        aclose = getattr(self._stream, "aclose", None)
+        # An async iterable may create a separate iterator that owns its cleanup. Close both the
+        # resolved iterator and the source object, while avoiding duplicate close calls when they
+        # are the same object.
+        resolved = self._stream
+        if self._source is resolved:
+            await self._close_object(resolved)
+            return
+
+        try:
+            await self._close_object(resolved)
+        except BaseException:
+            # The source may own transport cleanup independently of its iterator. Preserve the
+            # iterator's original error while still making a best effort to release the source.
+            with contextlib.suppress(BaseException):
+                await self._close_object(self._source)
+            raise
+        await self._close_object(self._source)
+
+    @staticmethod
+    async def _close_object(target: object | None) -> None:
+        if target is None:
+            return
+
+        aclose = getattr(target, "aclose", None)
         if callable(aclose):
             await aclose()
             return
 
-        close = getattr(self._stream, "close", None)
+        close = getattr(target, "close", None)
         if callable(close):
             close_result = close()
             if inspect.isawaitable(close_result):
@@ -332,15 +445,41 @@ def _get_wrapped_websocket_replay_safety(error: Exception) -> str | None:
     return replay_safety if replay_safety in {"safe", "unsafe"} else None
 
 
+def _mark_websocket_close_invalidation(error: Exception) -> None:
+    setattr(error, "_openai_agents_ws_close_invalidated", True)  # noqa: B010
+
+
+def _did_websocket_close_invalidate(error: Exception) -> bool:
+    return any(
+        getattr(candidate, "_openai_agents_ws_close_invalidated", False)
+        for candidate in _iter_retry_error_chain(error)
+    )
+
+
+def _websocket_close_invalidation_error() -> RuntimeError:
+    error = RuntimeError("Responses websocket connection closed while establishing a connection.")
+    _mark_websocket_close_invalidation(error)
+    return error
+
+
 def _did_start_websocket_response(error: Exception) -> bool:
     return bool(getattr(error, "_openai_agents_ws_response_started", False))
 
 
+def _is_websocket_disconnect_error(error: Exception) -> bool:
+    exc_module = error.__class__.__module__
+    exc_name = error.__class__.__name__
+    # websockets reports a peer closing before a valid HTTP upgrade as InvalidMessage. Only an
+    # InvalidMessage caused by EOFError is transient according to websockets' retry policy.
+    return exc_module.startswith("websockets") and (
+        exc_name.startswith("ConnectionClosed")
+        or (exc_name == "InvalidMessage" and isinstance(error.__cause__, EOFError))
+    )
+
+
 def _is_never_sent_websocket_error(error: Exception) -> bool:
     for candidate in _iter_retry_error_chain(error):
-        if candidate.__class__.__module__.startswith(
-            "websockets"
-        ) and candidate.__class__.__name__.startswith("ConnectionClosed"):
+        if _is_websocket_disconnect_error(candidate):
             if "client closed" not in str(candidate).lower():
                 return True
     return False
@@ -390,6 +529,12 @@ class OpenAIResponsesModel(Model):
     def _non_null_or_omit(self, value: Any) -> Any:
         return value if value is not None else omit
 
+    def _uses_official_openai_endpoint(self) -> bool:
+        return is_official_openai_client(self._get_client())
+
+    def _supports_default_prompt_cache_key(self) -> bool:
+        return is_official_openai_client(self._get_client())
+
     def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
         return get_openai_retry_advice(request)
 
@@ -406,17 +551,41 @@ class OpenAIResponsesModel(Model):
                 await close_result
 
     def _schedule_async_iterator_close(self, iterator: Any) -> None:
-        task = asyncio.create_task(self._maybe_aclose_async_iterator(iterator))
-        task.add_done_callback(self._consume_background_cleanup_task_result)
+        self._detach_stream_close(
+            asyncio.ensure_future(self._maybe_aclose_async_iterator(iterator))
+        )
+
+    async def _close_stream_allowing_background_completion(self, iterator: Any) -> None:
+        """Close the provider stream, letting an in-flight close finish in the background.
+
+        Cancellation can arrive while `aclose()` is already awaiting the provider. Shielding the
+        close and detaching that exact task keeps it running instead of abandoning it half-done,
+        and avoids starting a second close: re-closing a provider stream is not guaranteed to be
+        safe or idempotent.
+        """
+        close_task = asyncio.ensure_future(self._maybe_aclose_async_iterator(iterator))
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            self._detach_stream_close(close_task)
+            raise
+
+    def _detach_stream_close(self, close_task: asyncio.Future[None]) -> None:
+        if close_task.done():
+            self._consume_background_cleanup_task_result(close_task)
+            return
+        close_task.add_done_callback(self._consume_background_cleanup_task_result)
 
     @staticmethod
-    def _consume_background_cleanup_task_result(task: asyncio.Task[Any]) -> None:
+    def _consume_background_cleanup_task_result(task: asyncio.Future[Any]) -> None:
         try:
             task.result()
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            logger.debug(f"Background stream cleanup failed after cancellation: {exc}")
+            log_model_action_debug(
+                logger, "Background stream cleanup failed after cancellation", exc
+            )
 
     async def get_response(
         self,
@@ -433,6 +602,11 @@ class OpenAIResponsesModel(Model):
     ) -> ModelResponse:
         with response_span(disabled=tracing.is_disabled()) as span_response:
             try:
+                redacted_response_id_endpoint_is_trusted = (
+                    not tracing.include_data()
+                    and not tracing.is_disabled()
+                    and self._uses_official_openai_endpoint()
+                )
                 response = await self._fetch_response(
                     system_instructions,
                     input,
@@ -450,43 +624,48 @@ class OpenAIResponsesModel(Model):
                     logger.debug("LLM responded")
                 else:
                     logger.debug(
-                        "LLM resp:\n"
-                        f"""{
-                            json.dumps(
-                                [x.model_dump() for x in response.output],
-                                indent=2,
-                                ensure_ascii=False,
-                            )
-                        }\n"""
+                        "LLM resp:\n%s\n",
+                        json.dumps(
+                            [x.model_dump() for x in response.output],
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
                     )
 
-                usage = (
-                    Usage(
-                        requests=1,
-                        input_tokens=response.usage.input_tokens,
-                        output_tokens=response.usage.output_tokens,
-                        total_tokens=response.usage.total_tokens,
-                        input_tokens_details=response.usage.input_tokens_details,
-                        output_tokens_details=response.usage.output_tokens_details,
-                    )
-                    if response.usage
-                    else Usage()
-                )
+                usage = _usage_from_response(response)
+                if response.usage is not None or usage.requests:
+                    span_response.span_data.usage = model_usage_to_span_usage(usage)
 
                 if tracing.include_data():
                     span_response.span_data.response = response
                     span_response.span_data.input = input
+                elif (
+                    redacted_response_id_endpoint_is_trusted
+                    and self._uses_official_openai_endpoint()
+                ):
+                    span_response.span_data._response_id = response.id
+            except asyncio.CancelledError:
+                record_current_task_model_timeout_on_span(
+                    span_response,
+                    message="Error getting response",
+                    trace_include_sensitive_data=tracing.include_data(),
+                )
+                raise
             except Exception as e:
                 span_response.set_error(
                     SpanError(
                         message="Error getting response",
                         data={
-                            "error": str(e) if tracing.include_data() else e.__class__.__name__,
+                            "error": str(e)
+                            if tracing.include_data()
+                            else "Error details are redacted.",
                         },
                     )
                 )
-                request_id = getattr(e, "request_id", None)
-                logger.error(f"Error getting response: {e}. (request_id: {request_id})")
+                message = "Error getting response"
+                if not _debug.DONT_LOG_MODEL_DATA:
+                    message = f"{message} (request_id: {getattr(e, 'request_id', None)})"
+                log_model_action_error(logger, message, e)
                 raise
 
         return ModelResponse(
@@ -494,6 +673,11 @@ class OpenAIResponsesModel(Model):
             usage=usage,
             response_id=response.id,
             request_id=getattr(response, "_request_id", None),
+            raw_usage=(
+                _raw_usage_snapshot(response.usage)
+                if model_settings.preserve_raw_usage is True
+                else None
+            ),
         )
 
     async def stream_response(
@@ -514,6 +698,11 @@ class OpenAIResponsesModel(Model):
         """
         with response_span(disabled=tracing.is_disabled()) as span_response:
             try:
+                redacted_response_id_endpoint_is_trusted = (
+                    not tracing.include_data()
+                    and not tracing.is_disabled()
+                    and self._uses_official_openai_endpoint()
+                )
                 stream = await self._fetch_response(
                     system_instructions,
                     input,
@@ -528,6 +717,7 @@ class OpenAIResponsesModel(Model):
                 )
 
                 final_response: Response | None = None
+                terminal_failure_error: ModelBehaviorError | None = None
                 yielded_terminal_event = False
                 close_stream_in_background = False
                 try:
@@ -535,21 +725,64 @@ class OpenAIResponsesModel(Model):
                         chunk_type = getattr(chunk, "type", None)
                         if isinstance(chunk, ResponseCompletedEvent):
                             final_response = chunk.response
+                            if (
+                                redacted_response_id_endpoint_is_trusted
+                                and self._uses_official_openai_endpoint()
+                            ):
+                                span_response.span_data._response_id = chunk.response.id
+                            if model_settings.preserve_raw_usage is True:
+                                _attach_raw_usage_snapshot(chunk.response, chunk.response.usage)
+                            usage = _usage_from_response(chunk.response)
+                            if chunk.response.usage is not None or usage.requests:
+                                # Record before yielding the terminal event because consumers may
+                                # close the generator immediately after receiving it.
+                                span_response.span_data.usage = model_usage_to_span_usage(usage)
+                            if tracing.include_data():
+                                # Same reason as usage: a consumer that stops at the terminal
+                                # event closes the generator and never reaches the post-loop
+                                # assignment, so record the model I/O before yielding.
+                                span_response.span_data.response = chunk.response
+                                span_response.span_data.input = input
                         elif chunk_type in {
                             "response.failed",
                             "response.incomplete",
                         }:
                             terminal_response = getattr(chunk, "response", None)
-                            if isinstance(terminal_response, Response):
-                                final_response = terminal_response
+                            terminal_failure_error = response_terminal_failure_error(
+                                cast(str, chunk_type),
+                                terminal_response
+                                if isinstance(terminal_response, Response)
+                                else None,
+                            )
+                        elif chunk_type in {"error", "response.error"}:
+                            terminal_failure_error = response_error_event_failure_error(
+                                cast(str, chunk_type),
+                                chunk,
+                            )
                         if chunk_type in {
                             "response.completed",
                             "response.failed",
                             "response.incomplete",
+                            "error",
                             "response.error",
                         }:
                             yielded_terminal_event = True
+                            if terminal_failure_error is not None:
+                                # A consumer that stops at this event closes the
+                                # generator, which raises GeneratorExit at the yield
+                                # below and skips the raise after the loop, so the
+                                # span has to be annotated here or not at all.
+                                record_model_error_on_span(
+                                    span_response,
+                                    message="Error streaming response",
+                                    error=terminal_failure_error,
+                                    trace_include_sensitive_data=tracing.include_data(),
+                                )
                         yield chunk
+                        if terminal_failure_error is not None:
+                            # Close explicitly rather than advancing a failed stream: transport
+                            # teardown during iteration must not replace the provider's error.
+                            break
                 except asyncio.CancelledError:
                     close_stream_in_background = True
                     self._schedule_async_iterator_close(stream)
@@ -557,29 +790,41 @@ class OpenAIResponsesModel(Model):
                 finally:
                     if not close_stream_in_background:
                         try:
-                            await self._maybe_aclose_async_iterator(stream)
+                            await self._close_stream_allowing_background_completion(stream)
                         except Exception as exc:
                             if yielded_terminal_event:
-                                logger.debug(
-                                    f"Ignoring stream cleanup error after terminal event: {exc}"
+                                log_model_action_debug(
+                                    logger,
+                                    "Ignoring stream cleanup error after terminal event",
+                                    exc,
                                 )
                             else:
                                 raise
+                if terminal_failure_error is not None:
+                    raise terminal_failure_error
 
-                if final_response and tracing.include_data():
+                if final_response is not None and tracing.include_data():
                     span_response.span_data.response = final_response
                     span_response.span_data.input = input
-
+            except asyncio.CancelledError:
+                record_current_task_model_timeout_on_span(
+                    span_response,
+                    message="Error streaming response",
+                    trace_include_sensitive_data=tracing.include_data(),
+                )
+                raise
             except Exception as e:
                 span_response.set_error(
                     SpanError(
                         message="Error streaming response",
                         data={
-                            "error": str(e) if tracing.include_data() else e.__class__.__name__,
+                            "error": str(e)
+                            if tracing.include_data()
+                            else "Error details are redacted.",
                         },
                     )
                 )
-                logger.error(f"Error streaming response: {e}")
+                log_model_action_error(logger, "Error streaming response", e)
                 raise
 
     @overload
@@ -641,15 +886,23 @@ class OpenAIResponsesModel(Model):
 
         if not stream:
             response = await client.responses.create(**create_kwargs)
+            if getattr(response, "status", None) in {"failed", "incomplete"}:
+                raise response_terminal_failure_error(f"response.{response.status}", response)
+            _mark_transport_request_without_usage(response)
             return cast(Response, response)
 
         streaming_response = getattr(client.responses, "with_streaming_response", None)
         stream_create = getattr(streaming_response, "create", None)
         if not callable(stream_create):
             # Some tests and custom clients only implement `responses.create()`. Fall back to the
-            # older path in that case and simply omit request IDs for streamed calls.
+            # older path in that case and simply omit request IDs for streamed calls. Keep it in
+            # the existing stream wrapper so terminal request accounting stays transport-owned.
             response = await client.responses.create(**create_kwargs)
-            return cast(AsyncIterator[ResponseStreamEvent], response)
+            return _ResponseStreamWithRequestId(
+                cast(AsyncIterator[ResponseStreamEvent], response),
+                request_id=None,
+                cleanup=_no_stream_cleanup,
+            )
 
         # Keep the raw API response open while callers consume the SSE stream so we can expose
         # its request ID on terminal response payloads before cleanup closes the transport.
@@ -684,13 +937,6 @@ class OpenAIResponsesModel(Model):
         list_input = _to_dump_compatible(list_input)
         list_input = self._remove_openai_responses_api_incompatible_fields(list_input)
 
-        if model_settings.parallel_tool_calls and tools:
-            parallel_tool_calls: bool | Omit = True
-        elif model_settings.parallel_tool_calls is False:
-            parallel_tool_calls = False
-        else:
-            parallel_tool_calls = omit
-
         should_omit_model = prompt is not None and not self._model_is_explicit
         effective_request_model: str | ChatModel | None = None if should_omit_model else self.model
         effective_computer_tool_model = Converter.resolve_computer_tool_model(
@@ -719,6 +965,11 @@ class OpenAIResponsesModel(Model):
                 tool_choice=model_settings.tool_choice,
             )
         converted_tools_payload = _materialize_responses_tool_params(converted_tools.tools)
+        parallel_tool_calls: bool | Omit = (
+            self._non_null_or_omit(model_settings.parallel_tool_calls)
+            if prompt is not None or converted_tools_payload
+            else omit
+        )
         response_format = Converter.get_response_format(output_schema)
         model_param: str | ChatModel | Omit = (
             effective_request_model if effective_request_model is not None else omit
@@ -755,14 +1006,16 @@ class OpenAIResponsesModel(Model):
                 ensure_ascii=False,
             )
             logger.debug(
-                f"Calling LLM {self.model} with input:\n"
-                f"{input_json}\n"
-                f"Tools:\n{tools_json}\n"
-                f"Stream: {stream}\n"
-                f"Tool choice: {tool_choice_param}\n"
-                f"Response format: {response_format}\n"
-                f"Previous response id: {previous_response_id}\n"
-                f"Conversation id: {conversation_id}\n"
+                "Calling LLM %s with input:\n%s\nTools:\n%s\nStream: %s\nTool choice: %s\n"
+                "Response format: %s\nPrevious response id: %s\nConversation id: %s\n",
+                self.model,
+                input_json,
+                tools_json,
+                stream,
+                tool_choice_param,
+                response_format,
+                previous_response_id,
+                conversation_id,
             )
 
         extra_args = dict(model_settings.extra_args or {})
@@ -798,10 +1051,16 @@ class OpenAIResponsesModel(Model):
             "text": response_format,
             "store": self._non_null_or_omit(model_settings.store),
             "prompt_cache_retention": self._non_null_or_omit(model_settings.prompt_cache_retention),
+            "prompt_cache_options": self._non_null_or_omit(model_settings.prompt_cache_options),
             "reasoning": self._non_null_or_omit(model_settings.reasoning),
             "metadata": self._non_null_or_omit(model_settings.metadata),
+            "context_management": self._non_null_or_omit(model_settings.context_management),
         }
-        duplicate_extra_arg_keys = sorted(set(create_kwargs).intersection(extra_args))
+        duplicate_extra_arg_keys = sorted(
+            k
+            for k in extra_args
+            if k in create_kwargs and not _is_openai_omitted_value(create_kwargs[k])
+        )
         if duplicate_extra_arg_keys:
             if len(duplicate_extra_arg_keys) == 1:
                 key = duplicate_extra_arg_keys[0]
@@ -820,17 +1079,20 @@ class OpenAIResponsesModel(Model):
         This data transformation does not always guarantee that items from other provider
         interactions are accepted by the OpenAI Responses API.
 
-        Only items with truthy provider_data are processed.
         This function handles the following incompatibilities:
         - provider_data: Removes fields specific to other providers (e.g., Gemini, Claude).
         - Fake IDs: Removes temporary IDs (FAKE_RESPONSES_ID) that should not be sent to OpenAI.
         - Reasoning items: Filters out provider-specific reasoning items entirely.
         """
-        # Early return optimization: if no item has provider_data, return unchanged.
-        has_provider_data = any(
-            isinstance(item, dict) and item.get("provider_data") for item in list_input
+        # Early return optimization: skip the copy when nothing needs cleaning. Placeholder IDs
+        # are emitted without provider_data by several SDK paths, so they have to be checked
+        # independently of it.
+        needs_cleaning = any(
+            isinstance(item, dict)
+            and (item.get("provider_data") or item.get("id") == FAKE_RESPONSES_ID)
+            for item in list_input
         )
-        if not has_provider_data:
+        if not needs_cleaning:
             return list_input
 
         result = []
@@ -892,9 +1154,13 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
         openai_client: AsyncOpenAI,
         *,
         model_is_explicit: bool = True,
+        websocket_options: OpenAIResponsesWebSocketOptions | None = None,
     ) -> None:
         super().__init__(
             model=model, openai_client=openai_client, model_is_explicit=model_is_explicit
+        )
+        self._websocket_options = cast(
+            OpenAIResponsesWebSocketOptions, dict(websocket_options or {})
         )
         self._ws_connection: Any | None = None
         self._ws_connection_identity: tuple[str, tuple[tuple[str, str], ...]] | None = None
@@ -905,15 +1171,36 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
         )
         self._ws_client_close_generation = 0
 
+    def _uses_official_openai_endpoint(self) -> bool:
+        base_url = prepare_openai_client_websocket_base_url(
+            self._client,
+            context="Responses websocket",
+        )
+        return is_official_openai_base_url(base_url, websocket=True)
+
+    def _supports_default_prompt_cache_key(self) -> bool:
+        if self._client.websocket_base_url is not None:
+            return is_official_openai_base_url(self._client.websocket_base_url, websocket=True)
+        return super()._supports_default_prompt_cache_key()
+
     def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
+        if _did_websocket_close_invalidate(request.error):
+            return ModelRetryAdvice(
+                suggested=False,
+                reason=str(request.error),
+                normalized=ModelRetryNormalizedError(is_abort=True),
+            )
+
         stateful_request = bool(request.previous_response_id or request.conversation_id)
         wrapped_replay_safety = _get_wrapped_websocket_replay_safety(request.error)
         if wrapped_replay_safety == "unsafe":
-            if stateful_request or _did_start_websocket_response(request.error):
+            response_started = _did_start_websocket_response(request.error)
+            if stateful_request or response_started:
                 return ModelRetryAdvice(
                     suggested=False,
                     replay_safety="unsafe",
                     reason=str(request.error),
+                    response_started=response_started,
                 )
             return ModelRetryAdvice(
                 suggested=True,
@@ -958,6 +1245,18 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
             return ModelRetryAdvice(
                 suggested=True,
                 replay_safety="safe",
+                reason=str(request.error),
+            )
+        if (
+            isinstance(request.error, ResponsesWebSocketError)
+            and request.error.event_type == "error"
+            and (
+                request.error.code == "server_is_overloaded"
+                or (request.error.error_type == "server_error" and request.error.code is None)
+            )
+        ):
+            return ModelRetryAdvice(
+                suggested=True,
                 reason=str(request.error),
             )
         return super().get_retry_advice(request)
@@ -1042,8 +1341,10 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
             elif event_type in {"response.incomplete", "response.failed"}:
                 terminal_event_type = cast(str, event_type)
                 terminal_response = getattr(event, "response", None)
-                if isinstance(terminal_response, Response):
-                    final_response = terminal_response
+                raise response_terminal_failure_error(
+                    terminal_event_type,
+                    terminal_response if isinstance(terminal_response, Response) else None,
+                )
 
         if final_response is None:
             terminal_event_hint = (
@@ -1080,17 +1381,26 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
             )
             retry_pre_event_disconnect = _should_retry_pre_event_websocket_disconnect()
             while True:
-                connection = await self._await_websocket_with_timeout(
-                    self._ensure_websocket_connection(
-                        ws_url, request_headers, connect_timeout=request_timeouts.connect
-                    ),
-                    request_timeouts.connect,
-                    "connect",
-                )
+                connection: Any = None
                 received_any_event = False
                 yielded_terminal_event = False
                 sent_request_frame = False
                 try:
+                    connection = await self._await_websocket_with_timeout(
+                        self._ensure_websocket_connection(
+                            ws_url,
+                            request_headers,
+                            connect_timeout=request_timeouts.connect,
+                            request_close_generation=request_close_generation,
+                        ),
+                        request_timeouts.connect,
+                        "connect",
+                    )
+                    if self._ws_client_close_generation != request_close_generation:
+                        await self._drop_websocket_connection()
+                        connection = None
+                        raise _websocket_close_invalidation_error()
+
                     # Once we begin awaiting `send()`, treat the request as potentially
                     # transmitted to avoid replaying it on send/close races.
                     sent_request_frame = True
@@ -1137,6 +1447,8 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                         }
                         if is_terminal_event:
                             yielded_terminal_event = True
+                        if event_type == "response.completed":
+                            _mark_transport_request_without_usage(getattr(event, "response", None))
                         yield event
 
                         if is_terminal_event:
@@ -1145,11 +1457,15 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                     is_non_terminal_generator_exit = (
                         isinstance(exc, GeneratorExit) and not yielded_terminal_event
                     )
-                    if isinstance(exc, asyncio.CancelledError) or is_non_terminal_generator_exit:
-                        self._force_abort_websocket_connection(connection)
-                        self._clear_websocket_connection_state()
-                    elif not (yielded_terminal_event and isinstance(exc, GeneratorExit)):
-                        await self._drop_websocket_connection()
+                    if connection is not None:
+                        if (
+                            isinstance(exc, asyncio.CancelledError)
+                            or is_non_terminal_generator_exit
+                        ):
+                            self._force_abort_websocket_connection(connection)
+                            self._clear_websocket_connection_state()
+                        elif not (yielded_terminal_event and isinstance(exc, GeneratorExit)):
+                            await self._drop_websocket_connection()
 
                     if (
                         isinstance(exc, Exception)
@@ -1170,10 +1486,12 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                         is_pre_event_disconnect and not sent_request_frame
                     )
                     if (
-                        is_pre_event_disconnect
+                        isinstance(exc, Exception)
                         and self._ws_client_close_generation != request_close_generation
                     ):
-                        raise
+                        _mark_websocket_close_invalidation(exc)
+                        if is_pre_event_disconnect:
+                            raise
                     if retry_pre_event_disconnect and is_retryable_pre_event_disconnect:
                         retry_pre_event_disconnect = False
                         continue
@@ -1207,15 +1525,13 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                 "Responses websocket connection closed before a terminal response event."
             )
 
-        exc_module = exc.__class__.__module__
-        exc_name = exc.__class__.__name__
-        return exc_module.startswith("websockets") and exc_name.startswith("ConnectionClosed")
+        return _is_websocket_disconnect_error(exc)
 
     def _get_websocket_request_timeouts(self, timeout: Any) -> _WebsocketRequestTimeouts:
         if timeout is None or _is_openai_omitted_value(timeout):
             return _WebsocketRequestTimeouts(lock=None, connect=None, send=None, recv=None)
 
-        if isinstance(timeout, httpx.Timeout):
+        if isinstance(timeout, httpx2.Timeout) or is_legacy_httpx_instance(timeout, "Timeout"):
             return _WebsocketRequestTimeouts(
                 lock=None if timeout.pool is None else float(timeout.pool),
                 connect=None if timeout.connect is None else float(timeout.connect),
@@ -1223,7 +1539,7 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                 recv=None if timeout.read is None else float(timeout.read),
             )
 
-        if isinstance(timeout, (int, float)):
+        if isinstance(timeout, int | float):
             timeout_seconds = float(timeout)
             return _WebsocketRequestTimeouts(
                 lock=timeout_seconds,
@@ -1308,65 +1624,19 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
         return frame, ws_url, handshake_headers
 
     def _merge_websocket_headers(self, extra_headers: Mapping[str, Any]) -> dict[str, str]:
-        headers: dict[str, str] = {}
-        for key, value in self._client.default_headers.items():
-            if _is_openai_omitted_value(value):
-                continue
-            headers[key] = str(value)
-
-        for key, value in extra_headers.items():
-            if isinstance(value, NotGiven):
-                continue
-            header_key = str(key)
-            for existing_key in list(headers):
-                if existing_key.lower() == header_key.lower():
-                    del headers[existing_key]
-            if isinstance(value, Omit):
-                continue
-            headers[header_key] = str(value)
-
-        return headers
+        return merge_openai_client_websocket_headers(
+            self._client,
+            extra_headers=extra_headers,
+        )
 
     def _prepare_websocket_url(self, extra_query: Any) -> str:
-        if self._client.websocket_base_url is not None:
-            base_url = httpx.URL(self._client.websocket_base_url)
-            ws_scheme = {"http": "ws", "https": "wss"}.get(base_url.scheme, base_url.scheme)
-            base_url = base_url.copy_with(scheme=ws_scheme)
-        else:
-            client_base_url = self._client.base_url
-            ws_scheme = {"http": "ws", "https": "wss"}.get(
-                client_base_url.scheme, client_base_url.scheme
-            )
-            base_url = client_base_url.copy_with(scheme=ws_scheme)
-
-        params: dict[str, Any] = dict(base_url.params)
-        default_query = getattr(self._client, "default_query", None)
-        if default_query is not None and not _is_openai_omitted_value(default_query):
-            if not isinstance(default_query, Mapping):
-                raise UserError("Responses websocket client default_query must be a mapping.")
-            for key, value in default_query.items():
-                query_key = str(key)
-                if isinstance(value, Omit):
-                    params.pop(query_key, None)
-                    continue
-                if isinstance(value, NotGiven):
-                    continue
-                params[query_key] = value
-
-        if extra_query is not None and not _is_openai_omitted_value(extra_query):
-            if not isinstance(extra_query, Mapping):
-                raise UserError("Responses websocket extra_query must be a mapping.")
-            for key, value in extra_query.items():
-                query_key = str(key)
-                if isinstance(value, Omit):
-                    params.pop(query_key, None)
-                    continue
-                if isinstance(value, NotGiven):
-                    continue
-                params[query_key] = value
-
+        base_url = prepare_openai_client_websocket_base_url(
+            self._client,
+            extra_query=extra_query,
+            context="Responses websocket",
+        )
         path = base_url.path.rstrip("/") + "/responses"
-        return str(base_url.copy_with(path=path, params=params))
+        return str(base_url.copy_with(path=path))
 
     async def _ensure_websocket_connection(
         self,
@@ -1374,12 +1644,19 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
         headers: Mapping[str, str],
         *,
         connect_timeout: float | None,
+        request_close_generation: int | None = None,
     ) -> Any:
         running_loop = asyncio.get_running_loop()
         identity = (
             ws_url,
             tuple(sorted((str(key).lower(), str(value)) for key, value in headers.items())),
         )
+
+        if (
+            request_close_generation is not None
+            and self._ws_client_close_generation != request_close_generation
+        ):
+            raise _websocket_close_invalidation_error()
 
         if self._ws_connection is not None and self._ws_connection_identity == identity:
             if (
@@ -1390,6 +1667,11 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                 return self._ws_connection
         if self._ws_connection is not None:
             await self._drop_websocket_connection()
+        if (
+            request_close_generation is not None
+            and self._ws_client_close_generation != request_close_generation
+        ):
+            raise _websocket_close_invalidation_error()
         self._ws_connection = await self._open_websocket_connection(
             ws_url,
             headers,
@@ -1507,12 +1789,23 @@ class OpenAIResponsesWSModel(OpenAIResponsesModel):
                 "Install `websockets` or `openai[realtime]`."
             ) from exc
 
+        connect_kwargs: dict[str, Any] = {
+            "user_agent_header": None,
+            "additional_headers": dict(headers),
+            "logger": get_openai_websocket_logger(),
+            "max_size": None,
+            "open_timeout": connect_timeout,
+        }
+        if "ping_interval" in self._websocket_options:
+            connect_kwargs["ping_interval"] = self._websocket_options["ping_interval"]
+        if "ping_timeout" in self._websocket_options:
+            connect_kwargs["ping_timeout"] = self._websocket_options["ping_timeout"]
+        if "max_size" in self._websocket_options:
+            connect_kwargs["max_size"] = self._websocket_options["max_size"]
+
         return await connect(
             ws_url,
-            user_agent_header=None,
-            additional_headers=dict(headers),
-            max_size=None,
-            open_timeout=connect_timeout,
+            **connect_kwargs,
         )
 
 
@@ -1560,6 +1853,11 @@ class Converter:
             return "auto"
         elif tool_choice == "none":
             return "none"
+        elif tool_choice == "programmatic_tool_calling":
+            return cast(
+                response_create_params.ToolChoice,
+                {"type": "programmatic_tool_calling"},
+            )
         elif tool_choice == "file_search":
             return {
                 "type": "file_search",
@@ -1593,6 +1891,14 @@ class Converter:
         elif tool_choice == "code_interpreter":
             return {
                 "type": "code_interpreter",
+            }
+        elif tool_choice == "shell" and cls._has_shell_tool(tools):
+            return {
+                "type": "shell",
+            }
+        elif tool_choice == "apply_patch" and cls._has_apply_patch_tool(tools):
+            return {
+                "type": "apply_patch",
             }
         elif tool_choice == "mcp":
             # Note that this is still here for backwards compatibility,
@@ -1707,6 +2013,14 @@ class Converter:
             )
 
     @classmethod
+    def _has_shell_tool(cls, tools: Sequence[Tool] | None) -> bool:
+        return any(isinstance(tool, ShellTool) for tool in tools or ())
+
+    @classmethod
+    def _has_apply_patch_tool(cls, tools: Sequence[Tool] | None) -> bool:
+        return any(isinstance(tool, ApplyPatchTool) for tool in tools or ())
+
+    @classmethod
     def _has_computer_tool(cls, tools: Sequence[Tool] | None) -> bool:
         return any(isinstance(tool, ComputerTool) for tool in tools or ())
 
@@ -1714,7 +2028,7 @@ class Converter:
     def _has_unresolved_computer_tool(cls, tools: Sequence[Tool] | None) -> bool:
         return any(
             isinstance(tool, ComputerTool)
-            and not isinstance(tool.computer, (Computer, AsyncComputer))
+            and not isinstance(tool.computer, Computer | AsyncComputer)
             for tool in tools or ()
         )
 
@@ -1724,7 +2038,9 @@ class Converter:
 
     @classmethod
     def _is_ga_computer_model(cls, model: str | ChatModel | None) -> bool:
-        return isinstance(model, str) and model.startswith("gpt-5.4")
+        return isinstance(model, str) and (
+            model.startswith("gpt-5.4") or model.startswith("gpt-5.5")
+        )
 
     @classmethod
     def resolve_computer_tool_model(
@@ -1818,6 +2134,11 @@ class Converter:
             tools,
             allow_opaque_search_surface=allow_opaque_tool_search_surface,
         )
+        validate_responses_programmatic_tool_calling_configuration(
+            tools,
+            tool_choice=tool_choice,
+            allow_opaque_tool_search_surface=allow_opaque_tool_search_surface,
+        )
 
         computer_tools = [tool for tool in tools if isinstance(tool, ComputerTool)]
         if len(computer_tools) > 1:
@@ -1896,12 +2217,16 @@ class Converter:
         }
         if include_defer_loading and tool.defer_loading:
             function_tool_param["defer_loading"] = True
+        if tool.allowed_callers is not None:
+            function_tool_param["allowed_callers"] = tool.allowed_callers
+        if tool.output_json_schema is not None:
+            function_tool_param["output_schema"] = tool.output_json_schema
         return function_tool_param, None
 
     @classmethod
     def _convert_preview_computer_tool(cls, tool: ComputerTool[Any]) -> ResponsesToolParam:
         computer = tool.computer
-        if not isinstance(computer, (Computer, AsyncComputer)):
+        if not isinstance(computer, Computer | AsyncComputer):
             raise UserError(
                 "Computer tool is not initialized for serialization. Call "
                 "resolve_computer({ tool, run_context }) with a run context first "
@@ -1943,17 +2268,37 @@ class Converter:
             }
             if tool.external_web_access is not None:
                 web_search_tool["external_web_access"] = tool.external_web_access
+            if tool.search_content_types is not None:
+                web_search_tool["search_content_types"] = list(tool.search_content_types)
+            if tool.image_settings is not None:
+                web_search_tool["image_settings"] = dict(tool.image_settings)
+            web_search_include: ResponseIncludable | None = (
+                "web_search_call.results"
+                if tool.search_content_types is not None and "image" in tool.search_content_types
+                else None
+            )
             return (
                 _require_responses_tool_param(web_search_tool),
-                None,
+                web_search_include,
             )
         elif isinstance(tool, FileSearchTool):
             file_search_tool_param: FileSearchToolParam = {
                 "type": "file_search",
                 "vector_store_ids": tool.vector_store_ids,
             }
-            if tool.max_num_results:
-                file_search_tool_param["max_num_results"] = tool.max_num_results
+            if tool.max_num_results is not None:
+                if (
+                    isinstance(tool.max_num_results, bool)
+                    or not isinstance(tool.max_num_results, int)
+                    or not 0 <= tool.max_num_results <= 50
+                ):
+                    raise UserError(
+                        "FileSearchTool max_num_results must be zero, an integer between 1 and 50, "
+                        "or None."
+                    )
+                # Zero intentionally follows the released provider-default path, just like None.
+                if tool.max_num_results > 0:
+                    file_search_tool_param["max_num_results"] = tool.max_num_results
             if tool.ranking_options:
                 file_search_tool_param["ranking_options"] = tool.ranking_options
             if tool.filters:
@@ -1970,22 +2315,33 @@ class Converter:
                 else _require_responses_tool_param({"type": "computer"}),
                 None,
             )
+        elif isinstance(tool, CustomTool):
+            custom_tool_param: CustomToolParam = tool.tool_config
+            return custom_tool_param, None
         elif isinstance(tool, HostedMCPTool):
             return tool.tool_config, None
         elif isinstance(tool, ApplyPatchTool):
-            return ApplyPatchToolParam(type="apply_patch"), None
+            tool_config = getattr(tool, "tool_config", None)
+            if tool_config is not None:
+                converted_tool_config = dict(tool_config)
+            else:
+                converted_tool_config = dict(ApplyPatchToolParam(type="apply_patch"))
+            if tool.allowed_callers is not None:
+                converted_tool_config["allowed_callers"] = tool.allowed_callers
+            return _require_responses_tool_param(converted_tool_config), None
         elif isinstance(tool, ShellTool):
+            shell_tool_config: dict[str, Any] = {
+                "type": "shell",
+                "environment": cls._convert_shell_environment(tool.environment),
+            }
+            if tool.allowed_callers is not None:
+                shell_tool_config["allowed_callers"] = tool.allowed_callers
             return (
-                _require_responses_tool_param(
-                    {
-                        "type": "shell",
-                        "environment": cls._convert_shell_environment(tool.environment),
-                    }
-                ),
+                _require_responses_tool_param(shell_tool_config),
                 None,
             )
         elif isinstance(tool, ImageGenerationTool):
-            return tool.tool_config, None
+            return cast(ResponsesToolParam, tool.tool_config), None
         elif isinstance(tool, CodeInterpreterTool):
             return tool.tool_config, None
         elif isinstance(tool, LocalShellTool):
@@ -1999,6 +2355,8 @@ class Converter:
             if tool.parameters is not None:
                 tool_search_tool_param["parameters"] = tool.parameters
             return tool_search_tool_param, None
+        elif isinstance(tool, ProgrammaticToolCallingTool):
+            return _require_responses_tool_param({"type": "programmatic_tool_calling"}), None
         else:
             raise UserError(f"Unknown tool type: {type(tool)}, tool")
 

@@ -1,13 +1,52 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeGuard, TypeVar, runtime_checkable
 
-from typing_extensions import TypedDict, TypeGuard
+from typing_extensions import TypedDict
 
 if TYPE_CHECKING:
     from ..items import TResponseInputItem
+    from ..run_context import RunContextWrapper
     from .session_settings import SessionSettings
+
+
+_T = TypeVar("_T")
+
+
+async def _await_mutation(awaitable: Awaitable[_T]) -> _T:
+    """Wait for a mutation outcome despite repeated caller cancellation."""
+    task = asyncio.ensure_future(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+
+    try:
+        result = task.result()
+    except BaseException:
+        if cancellation is not None:
+            raise cancellation from None
+        raise
+    if cancellation is not None:
+        raise cancellation from None
+    return result
+
+
+@dataclass(frozen=True)
+class _CompactionSnapshot:
+    """Bounded logical history with a backend-owned atomic suffix replacement."""
+
+    items: list[TResponseInputItem]
+    complete: bool
+    replace_suffix: Callable[[int, list[TResponseInputItem]], Awaitable[bool]]
 
 
 @runtime_checkable
@@ -148,3 +187,63 @@ def is_openai_responses_compaction_aware_session(
     except Exception:
         return False
     return callable(run_compaction)
+
+
+def _session_method_accepts_wrapper(method: Any) -> bool:
+    """Return whether a session method opts into receiving ``wrapper``.
+
+    The public ``Session`` protocol keeps its released signatures so existing structural
+    implementations remain type-compatible. Custom sessions can opt in by adding a ``wrapper``
+    parameter that can be passed by keyword.
+    """
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except Exception:
+        return False
+
+    return any(
+        parameter.name == "wrapper"
+        and parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        for parameter in parameters
+    )
+
+
+def _session_accepts_wrapper(session: Any) -> bool:
+    """Return whether every history operation accepts ``wrapper``."""
+    try:
+        methods = (
+            session.get_items,
+            session.add_items,
+            session.pop_item,
+            session.clear_session,
+        )
+    except Exception:
+        return False
+    return all(_session_method_accepts_wrapper(method) for method in methods)
+
+
+def _get_session_wrapper(
+    session: Any,
+    wrapper: RunContextWrapper[Any] | None,
+) -> RunContextWrapper[Any] | None:
+    """Return ``wrapper`` only for sessions with a complete context-aware contract."""
+    if wrapper is None or not _session_accepts_wrapper(session):
+        return None
+    return wrapper
+
+
+async def _call_session_method(
+    method: Any,
+    /,
+    *args: Any,
+    wrapper: RunContextWrapper[Any] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Call a session method with its legacy shape unless it opts into ``wrapper``."""
+    if wrapper is not None and _session_method_accepts_wrapper(method):
+        kwargs["wrapper"] = wrapper
+    result = method(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result

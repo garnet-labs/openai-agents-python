@@ -12,6 +12,7 @@ from typing import Any
 from openai.types.responses import ResponseComputerToolCall, ResponseFunctionToolCall
 from openai.types.responses.response_output_item import LocalShellCall, McpApprovalRequest
 
+from .._function_tool_arguments import FunctionToolApproval
 from ..agent import Agent, ToolsToFinalOutputResult
 from ..guardrail import OutputGuardrailResult
 from ..handoffs import Handoff
@@ -19,12 +20,14 @@ from ..items import ModelResponse, RunItem, ToolApprovalItem, TResponseInputItem
 from ..tool import (
     ApplyPatchTool,
     ComputerTool,
+    CustomTool,
     FunctionTool,
     HostedMCPTool,
     LocalShellTool,
     ShellTool,
 )
 from ..tool_guardrails import ToolInputGuardrailResult, ToolOutputGuardrailResult
+from .items import NestedHistoryOwnedItem
 
 __all__ = [
     "QueueCompleteSentinel",
@@ -33,10 +36,12 @@ __all__ = [
     "ToolRunHandoff",
     "ToolRunFunction",
     "ToolRunComputerAction",
+    "ToolRunCustom",
     "ToolRunMCPApprovalRequest",
     "ToolRunLocalShellCall",
     "ToolRunShellCall",
     "ToolRunApplyPatchCall",
+    "ToolRunFunctionNotFound",
     "ProcessedResponse",
     "NextStepHandoff",
     "NextStepFinalOutput",
@@ -65,12 +70,25 @@ class ToolRunHandoff:
 class ToolRunFunction:
     tool_call: ResponseFunctionToolCall
     function_tool: FunctionTool
+    _approval_evaluation: FunctionToolApproval | None = dataclasses.field(default=None, repr=False)
+
+
+@dataclass
+class ToolRunFunctionNotFound:
+    tool_call: ResponseFunctionToolCall
+    tool_name: str
 
 
 @dataclass
 class ToolRunComputerAction:
     tool_call: ResponseComputerToolCall
     computer_tool: ComputerTool[Any]
+
+
+@dataclass
+class ToolRunCustom:
+    tool_call: Any
+    custom_tool: CustomTool
 
 
 @dataclass
@@ -109,6 +127,16 @@ class ProcessedResponse:
     tools_used: list[str]  # Names of all tools used, including hosted tools
     mcp_approval_requests: list[ToolRunMCPApprovalRequest]  # Only requests with callbacks
     interruptions: list[ToolApprovalItem]  # Tool approval items awaiting user decision
+    function_tools_not_found: list[ToolRunFunctionNotFound] = dataclasses.field(
+        default_factory=list
+    )
+    custom_tool_calls: list[ToolRunCustom] = dataclasses.field(default_factory=list)
+    mcp_tool_bindings: dict[str, tuple[str, str, int | None]] = dataclasses.field(
+        default_factory=dict
+    )
+    # Original invocation recipients, independent of the currently available callables.
+    tool_output_guardrail_result_start: int | None = None
+    # First checkpointed tool output guardrail result owned by this response.
 
     def has_tools_or_approvals_to_run(self) -> bool:
         # Handoffs, functions and computer actions need local processing
@@ -118,10 +146,12 @@ class ProcessedResponse:
                 self.handoffs,
                 self.functions,
                 self.computer_actions,
+                self.custom_tool_calls,
                 self.local_shell_calls,
                 self.shell_calls,
                 self.apply_patch_calls,
                 self.mcp_approval_requests,
+                self.function_tools_not_found,
             ]
         )
 
@@ -152,6 +182,12 @@ class NextStepInterruption:
     interruptions: list[ToolApprovalItem]
     """The list of tool calls awaiting approval."""
 
+    response_accepted: bool = False
+    """Whether the server accepted a response whose local processing is still incomplete."""
+
+    llm_end_hooks_started: bool = True
+    """Whether response-end hooks started before the interruption was persisted."""
+
 
 @dataclass
 class SingleStepResult:
@@ -181,11 +217,26 @@ class SingleStepResult:
     """Full unfiltered items for session history. When set, these are used instead of
     new_step_items for session saving and generated_items property."""
 
+    handoff_input_filtered: bool = False
+    """Whether a ``Handoff.input_filter`` ran while resolving this step. A filter's
+    authority over session history covers the turn it filtered, so held settlement
+    consults this to know whether an absent output was removed on purpose."""
+
+    nested_history_owned_items: list[NestedHistoryOwnedItem] | None = None
+    """Items moved verbatim into SDK-default nested history for this handoff.
+
+    ``None`` means this step did not replace handoff history. A list means the handoff rewrote
+    history, so prior ownership must be reconciled against the new input before adding these items.
+    """
+
     output_guardrail_results: list[OutputGuardrailResult] = dataclasses.field(default_factory=list)
     """Output guardrail results (populated when a final output is produced)."""
 
     processed_response: ProcessedResponse | None = None
     """The processed model response. This is needed for resuming from interruptions."""
+
+    has_recovered_tool_outputs: bool = False
+    """Whether this step delivers outputs checkpointed before a failed callback."""
 
     @property
     def generated_items(self) -> list[RunItem]:

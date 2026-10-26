@@ -3,14 +3,21 @@ from __future__ import annotations
 import inspect
 import json
 import weakref
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace as dataclasses_replace
-from typing import TYPE_CHECKING, Any, Callable, Generic, cast, overload
+from functools import partial
+from typing import TYPE_CHECKING, Any, Generic, TypeAlias, cast, overload
 
 from pydantic import TypeAdapter
-from typing_extensions import TypeAlias, TypeVar
+from typing_extensions import TypeVar
 
-from ..exceptions import ModelBehaviorError, UserError
+from ..exceptions import (
+    ModelBehaviorError,
+    UserError,
+    _detach_data_redacted_error_traceback,
+    _is_error_data_redacted,
+    _raise_data_redacted_error,
+)
 from ..items import RunItem, TResponseInputItem
 from ..run_context import RunContextWrapper, TContext
 from ..strict_schema import ensure_strict_json_schema
@@ -37,6 +44,27 @@ TAgent = TypeVar("TAgent", bound="AgentBase[Any]", default="Agent[Any]")
 
 OnHandoffWithInput = Callable[[RunContextWrapper[Any], THandoffInput], Any]
 OnHandoffWithoutInput = Callable[[RunContextWrapper[Any]], Any]
+
+
+async def _invoke_handoff_with_redaction(
+    invoke_handoff: Callable[[RunContextWrapper[Any], str | None], Awaitable[TAgent]],
+    ctx: RunContextWrapper[Any],
+    input_json: str | None = None,
+) -> TAgent:
+    redacted_error: ModelBehaviorError | None = None
+    try:
+        return await invoke_handoff(ctx, input_json)
+    except ModelBehaviorError as error:
+        if not _is_error_data_redacted(error):
+            raise
+        _detach_data_redacted_error_traceback(error)
+        redacted_error = error
+
+    invoke_handoff = cast(Any, None)
+    ctx = cast(Any, None)
+    input_json = "<redacted>"
+    assert redacted_error is not None
+    _raise_data_redacted_error(redacted_error)
 
 
 @dataclass(frozen=True)
@@ -80,7 +108,11 @@ class HandoffInputData:
         ```
         """
 
-        return dataclasses_replace(self, **kwargs)
+        cloned = dataclasses_replace(self, **kwargs)
+        owned_items = getattr(self, "_nested_history_owned_items", ())
+        if owned_items:
+            object.__setattr__(cloned, "_nested_history_owned_items", owned_items)
+        return cloned
 
 
 HandoffInputFilter: TypeAlias = Callable[[HandoffInputData], MaybeAwaitable[HandoffInputData]]
@@ -133,12 +165,25 @@ class Handoff(Generic[TContext, TAgent]):
     are free to modify the input history or new items as you see fit. The next agent receives the
     input history plus ``input_items`` when provided, otherwise it receives ``new_items``. Use
     ``input_items`` to filter model input while keeping ``new_items`` intact for session history.
+    The receiving agent's model receives the forwarded history. Use this filter to select content
+    that may be shared and remove or redact content that must not be shared.
+    Nested handoff history is not a redaction mechanism. ``nest_handoff_history`` builds history
+    from ``input_history``, ``pre_handoff_items``, and ``new_items``; it ignores ``input_items``.
+    Sanitize those three source fields before nesting, or sanitize the returned ``input_history``
+    before returning the nested result. The latter approach keeps the original ``new_items``
+    available for session history. Filtering only ``input_items`` does not sanitize nested history.
     IMPORTANT: in streaming mode, we will not stream anything as a result of this function. The
-    items generated before will already have been streamed.
+    items generated before will already have been streamed. Server-managed conversations
+    (`conversation_id`, `previous_response_id`, or `auto_previous_response_id`) do not support
+    handoff input filters.
     """
 
     nest_handoff_history: bool | None = None
-    """Override the run-level ``nest_handoff_history`` behavior for this handoff only."""
+    """Override the run-level ``nest_handoff_history`` behavior for this handoff only.
+
+    Server-managed conversations (`conversation_id`, `previous_response_id`, or
+    `auto_previous_response_id`) automatically disable nested handoff history with a warning.
+    """
 
     strict_json_schema: bool = True
     """Whether the input JSON schema is in strict mode. We strongly recommend setting this to True
@@ -159,12 +204,18 @@ class Handoff(Generic[TContext, TAgent]):
     )
     """Weak reference to the target agent when constructed via `handoff()`."""
 
+    _default_tool_identity: tuple[str, str] | None = field(default=None, kw_only=True, repr=False)
+    """The target agent name and derived tool name when the default was used."""
+
     def get_transfer_message(self, agent: AgentBase[Any]) -> str:
         return json.dumps({"assistant": agent.name})
 
     @classmethod
     def default_tool_name(cls, agent: AgentBase[Any]) -> str:
-        return _transforms.transform_string_function_style(f"transfer_to_{agent.name}")
+        return _transforms.transform_string_function_style(
+            f"transfer_to_{agent.name}",
+            warn_on_whitespace=False,
+        )
 
     @classmethod
     def default_tool_description(cls, agent: AgentBase[Any]) -> str:
@@ -246,12 +297,12 @@ def handoff(
             hidden from the LLM at runtime.
     """
 
-    assert (on_handoff and input_type) or not (on_handoff and input_type), (
-        "You must provide either both on_handoff and input_type, or neither"
-    )
+    if input_type is not None and on_handoff is None:
+        raise UserError("You must provide on_handoff when input_type is provided")
     type_adapter: TypeAdapter[Any] | None
     if input_type is not None:
-        assert callable(on_handoff), "on_handoff must be callable"
+        if not callable(on_handoff):
+            raise UserError("on_handoff must be callable")
         sig = inspect.signature(on_handoff)
         if len(sig.parameters) != 2:
             raise UserError("on_handoff must take two arguments: context and input")
@@ -266,7 +317,7 @@ def handoff(
             if len(sig.parameters) != 1:
                 raise UserError("on_handoff must take one argument: context")
 
-    async def _invoke_handoff(
+    async def _invoke_handoff_impl(
         ctx: RunContextWrapper[Any], input_json: str | None = None
     ) -> Agent[TContext]:
         if input_type is not None and type_adapter is not None:
@@ -283,18 +334,18 @@ def handoff(
                 json_str=input_json,
                 type_adapter=type_adapter,
                 partial=False,
+                strict=True,
+                contains_tool_data=True,
             )
             input_func = cast(OnHandoffWithInput[THandoffInput], on_handoff)
-            if inspect.iscoroutinefunction(input_func):
-                await input_func(ctx, validated_input)
-            else:
-                input_func(ctx, validated_input)
+            result = input_func(ctx, validated_input)
+            if inspect.isawaitable(result):
+                await result
         elif on_handoff is not None:
             no_input_func = cast(OnHandoffWithoutInput, on_handoff)
-            if inspect.iscoroutinefunction(no_input_func):
-                await no_input_func(ctx)
-            else:
-                no_input_func(ctx)
+            result = no_input_func(ctx)
+            if inspect.isawaitable(result):
+                await result
 
         return agent
 
@@ -319,11 +370,12 @@ def handoff(
         tool_name=tool_name,
         tool_description=tool_description,
         input_json_schema=input_json_schema,
-        on_invoke_handoff=_invoke_handoff,
+        on_invoke_handoff=partial(_invoke_handoff_with_redaction, _invoke_handoff_impl),
         input_filter=input_filter,
         nest_handoff_history=nest_handoff_history,
         agent_name=agent.name,
         is_enabled=_is_enabled if callable(is_enabled) else is_enabled,
+        _default_tool_identity=(agent.name, tool_name) if not tool_name_override else None,
     )
     handoff_obj._agent_ref = weakref.ref(agent)
     return handoff_obj

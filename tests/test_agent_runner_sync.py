@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Generator
-from typing import Any
+from typing import Any, Protocol
 
 import pytest
 
@@ -8,10 +8,16 @@ from agents.agent import Agent
 from agents.run import AgentRunner
 
 
+class _EventLoopPolicy(Protocol):
+    def get_event_loop(self) -> asyncio.AbstractEventLoop: ...
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop | None) -> None: ...
+
+
 @pytest.fixture
-def fresh_event_loop_policy() -> Generator[asyncio.AbstractEventLoopPolicy, None, None]:
+def fresh_event_loop_policy() -> Generator[_EventLoopPolicy, None, None]:
     policy_before = asyncio.get_event_loop_policy()
-    new_policy = asyncio.DefaultEventLoopPolicy()
+    new_policy = type(policy_before)()
     asyncio.set_event_loop_policy(new_policy)
     try:
         yield new_policy
@@ -58,6 +64,33 @@ def test_run_sync_creates_default_loop_when_missing(monkeypatch, fresh_event_loo
 
     fresh_event_loop_policy.set_event_loop(None)
     created_loop.close()
+
+
+def test_run_sync_replaces_closed_default_loop(monkeypatch, fresh_event_loop_policy):
+    runner = AgentRunner()
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def fake_run(self, *_args, **_kwargs):
+        observed_loops.append(asyncio.get_running_loop())
+        return object()
+
+    monkeypatch.setattr(AgentRunner, "run", fake_run, raising=False)
+
+    closed_loop = asyncio.new_event_loop()
+    fresh_event_loop_policy.set_event_loop(closed_loop)
+    closed_loop.close()
+
+    try:
+        runner.run_sync(Agent(name="test-agent"), "input")
+        replacement_loop = observed_loops[0]
+        assert replacement_loop is fresh_event_loop_policy.get_event_loop()
+        assert replacement_loop is not closed_loop
+        assert not replacement_loop.is_closed()
+    finally:
+        current_loop = fresh_event_loop_policy.get_event_loop()
+        fresh_event_loop_policy.set_event_loop(None)
+        if not current_loop.is_closed():
+            current_loop.close()
 
 
 def test_run_sync_errors_when_loop_already_running(monkeypatch, fresh_event_loop_policy):

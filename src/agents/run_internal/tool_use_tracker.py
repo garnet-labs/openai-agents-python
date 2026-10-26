@@ -5,8 +5,13 @@ its state plus lightweight tool-call type utilities. Internal use only.
 
 from __future__ import annotations
 
-from typing import Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, get_args, get_origin
 
+from .._run_state_agent_identity import (
+    _build_agent_identity_keys_by_id,
+    _build_agent_identity_map,
+    _build_agent_map,
+)
 from .._tool_identity import get_function_tool_trace_name
 from ..agent import Agent
 from ..items import (
@@ -17,8 +22,10 @@ from ..items import (
     ToolSearchCallItem,
     ToolSearchOutputItem,
 )
-from ..run_state import _build_agent_map
 from .run_steps import ProcessedResponse, ToolRunFunction
+
+if TYPE_CHECKING:
+    from ..models.interface import Model
 
 __all__ = [
     "AgentToolUseTracker",
@@ -51,6 +58,12 @@ class AgentToolUseTracker:
         self.agent_map: dict[str, set[str]] = {}
         # Instance-keyed list is used for runtime checks.
         self.agent_to_tools: list[tuple[Agent[Any], list[str]]] = []
+        # Model instances are tracked by identity for run-scoped resource cleanup.
+        self.models: list[Model] = []
+
+    def record_model(self, model: Model) -> None:
+        if not any(existing is model for existing in self.models):
+            self.models.append(model)
 
     def record_used_tools(self, agent: Agent[Any], tools: list[ToolRunFunction]) -> None:
         tool_names = [
@@ -112,11 +125,23 @@ class AgentToolUseTracker:
         return tracker
 
 
-def serialize_tool_use_tracker(tool_use_tracker: AgentToolUseTracker) -> dict[str, list[str]]:
+def serialize_tool_use_tracker(
+    tool_use_tracker: AgentToolUseTracker,
+    *,
+    starting_agent: Agent[Any] | None = None,
+) -> dict[str, list[str]]:
     """Convert the AgentToolUseTracker into a serializable snapshot."""
+    agent_identity_keys_by_id = (
+        _build_agent_identity_keys_by_id(starting_agent) if starting_agent is not None else None
+    )
     snapshot: dict[str, list[str]] = {}
     for agent, tool_names in tool_use_tracker.agent_to_tools:
-        snapshot[agent.name] = list(tool_names)
+        agent_key = None
+        if agent_identity_keys_by_id is not None:
+            agent_key = agent_identity_keys_by_id.get(id(agent))
+        if agent_key is None:
+            agent_key = getattr(agent, "name", agent.__class__.__name__)
+        snapshot.setdefault(agent_key, []).extend(tool_names)
     return snapshot
 
 
@@ -131,8 +156,11 @@ def hydrate_tool_use_tracker(
         return
 
     agent_map = _build_agent_map(starting_agent)
+    agent_identity_map = _build_agent_identity_map(starting_agent)
     for agent_name, tool_names in snapshot.items():
-        agent = agent_map.get(agent_name)
+        agent = agent_identity_map.get(agent_name)
+        if agent is None:
+            agent = agent_map.get(agent_name)
         if agent is None:
             continue
         tool_use_tracker.add_tool_use(agent, list(tool_names))

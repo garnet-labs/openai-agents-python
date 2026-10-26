@@ -1,6 +1,6 @@
 import asyncio
 
-from agents import function_tool
+from agents.decorators import tool
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from agents.realtime import RealtimeAgent, realtime_handoff
 
@@ -11,12 +11,8 @@ will use the agent returned from get_starting_agent() as the starting agent."""
 ### TOOLS
 
 
-@function_tool(
-    name_override="faq_lookup_tool", description_override="Lookup frequently asked questions."
-)
+@tool(name_override="faq_lookup_tool", description_override="Lookup frequently asked questions.")
 async def faq_lookup_tool(question: str) -> str:
-    print("faq_lookup_tool called with question:", question)
-
     # Simulate a slow API call
     await asyncio.sleep(3)
 
@@ -38,7 +34,7 @@ async def faq_lookup_tool(question: str) -> str:
     return "I'm sorry, I don't know the answer to that question."
 
 
-@function_tool(needs_approval=True)
+@tool(needs_approval=True)
 async def update_seat(confirmation_number: str, new_seat: str) -> str:
     """
     Update the seat for a given confirmation number.
@@ -50,7 +46,7 @@ async def update_seat(confirmation_number: str, new_seat: str) -> str:
     return f"Updated seat to {new_seat} for confirmation number {confirmation_number}"
 
 
-@function_tool
+@tool
 def get_weather(city: str) -> str:
     """Get the weather in a city."""
     return f"The weather in {city} is sunny."
@@ -91,11 +87,18 @@ triage_agent = RealtimeAgent(
         "You are a helpful triaging agent. You can use your tools to delegate questions to other appropriate agents."
     ),
     tools=[get_weather],
-    handoffs=[faq_agent, realtime_handoff(seat_booking_agent)],
+    handoffs=[
+        realtime_handoff(faq_agent, tool_name_override="transfer_to_faq_agent"),
+        realtime_handoff(seat_booking_agent, tool_name_override="transfer_to_seat_booking_agent"),
+    ],
 )
 
-faq_agent.handoffs.append(triage_agent)
-seat_booking_agent.handoffs.append(triage_agent)
+faq_agent.handoffs.append(
+    realtime_handoff(triage_agent, tool_name_override="transfer_to_triage_agent")
+)
+seat_booking_agent.handoffs.append(
+    realtime_handoff(triage_agent, tool_name_override="transfer_to_triage_agent")
+)
 
 
 def get_starting_agent() -> RealtimeAgent:

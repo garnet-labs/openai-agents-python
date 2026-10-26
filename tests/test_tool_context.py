@@ -12,6 +12,23 @@ from agents.usage import Usage
 from tests.utils.hitl import make_context_wrapper
 
 
+def test_tool_context_is_hashable_like_run_context_wrapper() -> None:
+    # RunContextWrapper is declared with @dataclass(eq=False) so instances remain
+    # hashable by identity. ToolContext inherits from it and must preserve that
+    # contract; a bare @dataclass on the subclass would set __hash__ = None.
+    parent: RunContextWrapper[dict[str, object]] = RunContextWrapper(context={})
+    child: ToolContext[dict[str, object]] = ToolContext(
+        context={},
+        tool_name="t",
+        tool_call_id="call-hash",
+        tool_arguments="{}",
+    )
+
+    assert hash(parent) == hash(parent)
+    assert hash(child) == hash(child)
+    assert {child: "value"}[child] == "value"
+
+
 def test_tool_context_requires_fields() -> None:
     ctx: RunContextWrapper[dict[str, object]] = RunContextWrapper(context={})
     with pytest.raises(ValueError):
@@ -76,6 +93,35 @@ def test_tool_context_constructor_accepts_agent_keyword() -> None:
     )
 
     assert tool_ctx.agent is agent
+
+
+def test_tool_context_constructor_normalizes_dictionary_run_config() -> None:
+    tool_ctx: ToolContext[dict[str, object]] = ToolContext(
+        context={},
+        tool_name="my_tool",
+        tool_call_id="call-2",
+        tool_arguments="{}",
+        run_config={
+            "tracing_disabled": True,
+            "model_settings": {"temperature": 0.0},
+        },
+    )
+
+    assert isinstance(tool_ctx.run_config, RunConfig)
+    assert tool_ctx.run_config.tracing_disabled is True
+    assert tool_ctx.run_config.model_settings is not None
+    assert tool_ctx.run_config.model_settings.temperature == 0.0
+
+
+def test_tool_context_constructor_rejects_unknown_dictionary_run_config_fields() -> None:
+    with pytest.raises(TypeError, match="Unknown run_config settings: tracin_disabled"):
+        ToolContext(
+            context={},
+            tool_name="my_tool",
+            tool_call_id="call-2",
+            tool_arguments="{}",
+            run_config={"tracin_disabled": True},
+        )
 
 
 def test_tool_context_constructor_infers_namespace_from_tool_call() -> None:
@@ -202,6 +248,25 @@ def test_tool_context_from_agent_context_prefers_explicit_run_config() -> None:
     )
 
     assert tool_ctx.run_config is explicit_run_config
+
+
+def test_tool_context_from_agent_context_normalizes_dictionary_run_config() -> None:
+    tool_call = ResponseFunctionToolCall(
+        type="function_call",
+        name="test_tool",
+        call_id="call-1",
+        arguments="{}",
+    )
+
+    tool_ctx = ToolContext.from_agent_context(
+        make_context_wrapper(),
+        tool_call_id="call-1",
+        tool_call=tool_call,
+        run_config={"tracing_disabled": True},
+    )
+
+    assert isinstance(tool_ctx.run_config, RunConfig)
+    assert tool_ctx.run_config.tracing_disabled is True
 
 
 @pytest.mark.asyncio

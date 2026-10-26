@@ -17,7 +17,7 @@ async def run_demo_loop(
     *,
     stream: bool = True,
     context: TContext | None = None,
-    max_turns: int = DEFAULT_MAX_TURNS,
+    max_turns: int | None = DEFAULT_MAX_TURNS,
 ) -> None:
     """Run a simple REPL loop with the given agent.
 
@@ -29,20 +29,22 @@ async def run_demo_loop(
         agent: The starting agent to run.
         stream: Whether to stream the agent output.
         context: Additional context information to pass to the runner.
-        max_turns: Maximum number of turns for the runner to iterate.
+        max_turns: Maximum number of turns for the runner to iterate. Pass ``None`` to disable
+            the turn limit.
     """
 
     current_agent = agent
     input_items: list[TResponseInputItem] = []
     while True:
         try:
-            user_input = input(" > ")
+            # Keep terminal input on the main thread so Ctrl+C interrupts it immediately.
+            user_input = input(" > ")  # noqa: ASYNC250
         except (EOFError, KeyboardInterrupt):
             print()
             break
         if user_input.strip().lower() in {"exit", "quit"}:
             break
-        if not user_input:
+        if not user_input.strip():
             continue
 
         input_items.append({"role": "user", "content": user_input})

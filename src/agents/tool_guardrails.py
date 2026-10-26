@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, overload
+from typing import TYPE_CHECKING, Any, Generic, Literal, overload
 
 from typing_extensions import TypedDict, TypeVar
 
@@ -212,11 +212,11 @@ _ToolInputFuncAsync = Callable[[ToolInputGuardrailData], Awaitable[ToolGuardrail
 
 
 @overload
-def tool_input_guardrail(func: _ToolInputFuncSync): ...
+def tool_input_guardrail(func: _ToolInputFuncSync) -> ToolInputGuardrail[Any]: ...
 
 
 @overload
-def tool_input_guardrail(func: _ToolInputFuncAsync): ...
+def tool_input_guardrail(func: _ToolInputFuncAsync) -> ToolInputGuardrail[Any]: ...
 
 
 @overload
@@ -248,11 +248,11 @@ _ToolOutputFuncAsync = Callable[[ToolOutputGuardrailData], Awaitable[ToolGuardra
 
 
 @overload
-def tool_output_guardrail(func: _ToolOutputFuncSync): ...
+def tool_output_guardrail(func: _ToolOutputFuncSync) -> ToolOutputGuardrail[Any]: ...
 
 
 @overload
-def tool_output_guardrail(func: _ToolOutputFuncAsync): ...
+def tool_output_guardrail(func: _ToolOutputFuncAsync) -> ToolOutputGuardrail[Any]: ...
 
 
 @overload

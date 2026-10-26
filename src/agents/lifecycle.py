@@ -1,4 +1,4 @@
-from typing import Any, Generic, Optional
+from typing import Any, Generic
 
 from typing_extensions import TypeVar
 
@@ -19,7 +19,7 @@ class RunHooksBase(Generic[TContext, TAgent]):
         self,
         context: RunContextWrapper[TContext],
         agent: Agent[TContext],
-        system_prompt: Optional[str],
+        system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
         """Called just before invoking the LLM for this agent."""
@@ -36,6 +36,19 @@ class RunHooksBase(Generic[TContext, TAgent]):
 
     async def on_agent_start(self, context: AgentHookContext[TContext], agent: TAgent) -> None:
         """Called before the agent is invoked. Called each time the current agent changes.
+
+        Keep ``agent.tools`` unchanged when sharing an agent across concurrent runs.
+        Tool-list replacement while concurrent runs use the same agent raises ``UserError``
+        before newly resolved tools reach the model. In-place mutations of a shared list are not
+        isolated. Changes to shared tool objects, including ``FunctionTool.is_enabled`` and
+        ``FunctionTool.needs_approval``, are not isolated or detected. For per-run configuration
+        changes, use an independent agent, tools list, and tool objects. Copying only the list
+        still shares its tool objects. Alternatively, keep the tool configuration unchanged and
+        use context-based enablement and approval callbacks.
+
+        When restoring a serialized ``RunState``, rebuild any hook-created tools on the supplied
+        agents before loading the state. Serialized state does not contain Python tool definitions,
+        and start hooks are not replayed before pending approval calls are resolved.
 
         Args:
             context: The agent hook context.
@@ -73,7 +86,13 @@ class RunHooksBase(Generic[TContext, TAgent]):
         agent: TAgent,
         tool: Tool,
     ) -> None:
-        """Called immediately before a local tool is invoked."""
+        """Called immediately before a local tool is invoked.
+
+        For function-tool invocations, ``context`` is typically a ``ToolContext`` instance,
+        which exposes tool-call-specific metadata such as ``tool_call_id``, ``tool_name``,
+        and ``tool_arguments``. Other local tool families may provide a plain
+        ``RunContextWrapper`` instead.
+        """
         pass
 
     async def on_tool_end(
@@ -81,9 +100,19 @@ class RunHooksBase(Generic[TContext, TAgent]):
         context: RunContextWrapper[TContext],
         agent: TAgent,
         tool: Tool,
-        result: str,
+        result: object,
     ) -> None:
-        """Called immediately after a local tool is invoked."""
+        """Called immediately after a local tool is invoked.
+
+        For function-tool invocations, ``context`` is typically a ``ToolContext`` instance,
+        which exposes tool-call-specific metadata such as ``tool_call_id``, ``tool_name``,
+        and ``tool_arguments``. Other local tool families may provide a plain
+        ``RunContextWrapper`` instead.
+
+        Simple tool outputs are typically ``str`` values. Function tools may also return
+        structured tool output objects or any value the SDK can stringify before sending it to
+        the model.
+        """
         pass
 
 
@@ -97,6 +126,19 @@ class AgentHooksBase(Generic[TContext, TAgent]):
     async def on_start(self, context: AgentHookContext[TContext], agent: TAgent) -> None:
         """Called before the agent is invoked. Called each time the running agent is changed to this
         agent.
+
+        Keep ``agent.tools`` unchanged when sharing an agent across concurrent runs.
+        Tool-list replacement while concurrent runs use the same agent raises ``UserError``
+        before newly resolved tools reach the model. In-place mutations of a shared list are not
+        isolated. Changes to shared tool objects, including ``FunctionTool.is_enabled`` and
+        ``FunctionTool.needs_approval``, are not isolated or detected. For per-run configuration
+        changes, use an independent agent, tools list, and tool objects. Copying only the list
+        still shares its tool objects. Alternatively, keep the tool configuration unchanged and
+        use context-based enablement and approval callbacks.
+
+        When restoring a serialized ``RunState``, rebuild any hook-created tools on the supplied
+        agents before loading the state. Serialized state does not contain Python tool definitions,
+        and start hooks are not replayed before pending approval calls are resolved.
 
         Args:
             context: The agent hook context.
@@ -135,7 +177,13 @@ class AgentHooksBase(Generic[TContext, TAgent]):
         agent: TAgent,
         tool: Tool,
     ) -> None:
-        """Called immediately before a local tool is invoked."""
+        """Called immediately before a local tool is invoked.
+
+        For function-tool invocations, ``context`` is typically a ``ToolContext`` instance,
+        which exposes tool-call-specific metadata such as ``tool_call_id``, ``tool_name``,
+        and ``tool_arguments``. Other local tool families may provide a plain
+        ``RunContextWrapper`` instead.
+        """
         pass
 
     async def on_tool_end(
@@ -143,16 +191,26 @@ class AgentHooksBase(Generic[TContext, TAgent]):
         context: RunContextWrapper[TContext],
         agent: TAgent,
         tool: Tool,
-        result: str,
+        result: object,
     ) -> None:
-        """Called immediately after a local tool is invoked."""
+        """Called immediately after a local tool is invoked.
+
+        For function-tool invocations, ``context`` is typically a ``ToolContext`` instance,
+        which exposes tool-call-specific metadata such as ``tool_call_id``, ``tool_name``,
+        and ``tool_arguments``. Other local tool families may provide a plain
+        ``RunContextWrapper`` instead.
+
+        Simple tool outputs are typically ``str`` values. Function tools may also return
+        structured tool output objects or any value the SDK can stringify before sending it to
+        the model.
+        """
         pass
 
     async def on_llm_start(
         self,
         context: RunContextWrapper[TContext],
         agent: Agent[TContext],
-        system_prompt: Optional[str],
+        system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
         """Called immediately before the agent issues an LLM call."""

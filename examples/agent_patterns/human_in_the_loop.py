@@ -5,17 +5,26 @@ This example demonstrates how to:
 2. Handle interruptions when tool approval is needed
 3. Serialize/deserialize run state to continue execution later
 4. Approve or reject tool calls based on user input
+
+The saved file must remain under trusted application control. Do not replace it
+with a snapshot supplied by a browser or another untrusted client. For a client
+approval interface, see human_in_the_loop_server.py.
 """
 
 import asyncio
 import json
 from pathlib import Path
 
-from agents import Agent, Runner, RunState, function_tool
+from agents import (
+    Agent,
+    Runner,
+    RunState,
+)
+from agents.decorators import tool
 from examples.auto_mode import confirm_with_fallback
 
 
-@function_tool
+@tool
 async def get_weather(city: str) -> str:
     """Get the weather for a given city.
 
@@ -33,7 +42,7 @@ async def _needs_temperature_approval(_ctx, params, _call_id) -> bool:
     return "Oakland" in params.get("city", "")
 
 
-@function_tool(
+@tool(
     # Dynamic approval: only require approval for Oakland
     needs_approval=_needs_temperature_approval
 )
