@@ -1,0 +1,32 @@
+name: Linux validation
+
+on:
+  push:
+    branches: [ci-linux-validation]
+
+permissions: {}
+
+jobs:
+  validation:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: "actions/checkout@v6"
+        with:
+          persist-credentials: false
+      - uses: "garnet-org/action@v2.6.0"
+      - uses: "actions/setup-python@v6"
+        with:
+          python-version: "3.13"
+      - uses: "astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7"
+        with:
+          enable-cache: false
+      - name: "Install dependencies"
+        run: |
+          make sync
+      - name: "Run checks"
+        run: |
+          make tests
